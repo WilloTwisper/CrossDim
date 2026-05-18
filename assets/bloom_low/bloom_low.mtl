@@ -1,0 +1,6 @@
+newmtl tripo_material_545c5897_3ca4_4577_bc33_50f94f59a501
+Kd 1.000000000 1.000000000 1.000000000
+d 1.000000000
+illum 2
+map_Kd bloom_low_basecolor.jpg
+

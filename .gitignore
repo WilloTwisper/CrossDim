@@ -1,0 +1,10 @@
+build/
+.vscode/
+*.exe
+*.obj
+*.pdb
+*.ilk
+imgui.ini
+*.cdmesh
+assets/bloom_high/*.obj
+vendor/imgui/
