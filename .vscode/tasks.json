@@ -1,0 +1,41 @@
+{
+    "version": "2.0.0",
+    "tasks":[
+        {
+            "label": "Build CrossDim",
+            "type": "shell",
+            "command": "cl.exe",
+            "args":[
+                "/utf-8",
+                "/O2",  
+                "/Zi",
+                "/EHsc",
+                "/nologo",
+                "/I", "${workspaceFolder}\\vendor\\imgui",
+                "/I", "${workspaceFolder}\\src",
+                "${workspaceFolder}\\src\\main.cpp",
+                "${workspaceFolder}\\src\\Engine\\Camera.cpp", 
+                "${workspaceFolder}\\src\\Engine\\SkyboxRenderer.cpp", 
+                "${workspaceFolder}\\src\\Engine\\CubeRenderer.cpp",
+                "${workspaceFolder}\\src\\Engine\\ObjLoader.cpp",
+                "${workspaceFolder}\\src\\Engine\\ModelRenderer.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\imgui.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\imgui_draw.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\imgui_tables.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\imgui_widgets.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\backends\\imgui_impl_win32.cpp",
+                "${workspaceFolder}\\vendor\\imgui\\backends\\imgui_impl_dx11.cpp",
+                "d3dcompiler.lib",
+                "/Fe:${workspaceFolder}\\build\\CrossDim.exe",
+                "/Fd:${workspaceFolder}\\build\\",
+                "/Fo:${workspaceFolder}\\build\\"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$msCompile"],
+            "group": { "kind": "build", "isDefault": true },
+            "detail": "编译 CrossDim 引擎"
+        }
+    ]
+}

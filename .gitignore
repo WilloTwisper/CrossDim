@@ -1,5 +1,5 @@
 build/
-.vscode/
+.vscode/settings.json
 *.exe
 *.obj
 *.pdb
@@ -7,4 +7,4 @@ build/
 imgui.ini
 *.cdmesh
 assets/bloom_high/*.obj
-vendor/imgui/
+
