@@ -11,11 +11,80 @@
 
 class TextureLoader {
 public:
+    static ID3D11ShaderResourceView* LoadIconFromHandle(ID3D11Device* device, HICON iconHandle) {
+        if (!device || !iconHandle) return nullptr;
+        HICON hIcon = CopyIcon(iconHandle);
+        if (!hIcon) return nullptr;
+
+        int texSize = 256;
+        HDC hdcScreen = GetDC(NULL);
+        HDC hdcMem = CreateCompatibleDC(hdcScreen);
+
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = texSize;
+        bi.bmiHeader.biHeight = -texSize;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        void* pBits = nullptr;
+        HBITMAP hBitmap = CreateDIBSection(hdcMem, &bi, DIB_RGB_COLORS, &pBits, NULL, 0);
+        HGDIOBJ hOld = SelectObject(hdcMem, hBitmap);
+
+        memset(pBits, 0, texSize * texSize * 4);
+        DrawIconEx(hdcMem, 0, 0, hIcon, texSize, texSize, 0, NULL, DI_NORMAL);
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = texSize; desc.Height = texSize;
+        desc.MipLevels = 1; desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = pBits;
+        initData.SysMemPitch = texSize * 4;
+
+        ID3D11Texture2D* pTexture = nullptr;
+        HRESULT hr = device->CreateTexture2D(&desc, &initData, &pTexture);
+
+        SelectObject(hdcMem, hOld);
+        DeleteObject(hBitmap);
+        DeleteDC(hdcMem);
+        ReleaseDC(NULL, hdcScreen);
+        DestroyIcon(hIcon);
+
+        if (FAILED(hr)) return nullptr;
+
+        ID3D11ShaderResourceView* pSRV = nullptr;
+        device->CreateShaderResourceView(pTexture, nullptr, &pSRV);
+        pTexture->Release();
+
+        return pSRV;
+    }
+
     static ID3D11ShaderResourceView* LoadIconFromExe(ID3D11Device* device, LPCWSTR exePath) {
         HICON hIcon = NULL;
+        bool destroyIcon = true;
         PrivateExtractIconsW(exePath, 0, 256, 256, &hIcon, NULL, 1, LR_LOADFROMFILE);
         if (!hIcon) {
             ExtractIconExW(exePath, 0, &hIcon, NULL, 1);
+            if (!hIcon) {
+                SHFILEINFOW sfi = {};
+                if (SHGetFileInfoW(exePath, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
+                    hIcon = sfi.hIcon;
+                    destroyIcon = true;
+                } else {
+                    HICON fallback = (HICON)LoadImageW(NULL, reinterpret_cast<LPCWSTR>(ULONG_PTR(32512)), IMAGE_ICON, 0, 0,
+                                                       LR_DEFAULTSIZE | LR_SHARED);
+                    if (fallback) {
+                        hIcon = CopyIcon(fallback);
+                        destroyIcon = true;
+                    }
+                }
+            }
             if (!hIcon) return nullptr;
         }
 
@@ -61,7 +130,9 @@ public:
         DeleteObject(hBitmap);
         DeleteDC(hdcMem);
         ReleaseDC(NULL, hdcScreen);
-        DestroyIcon(hIcon);
+        if (destroyIcon && hIcon) {
+            DestroyIcon(hIcon);
+        }
 
         if (FAILED(hr)) return nullptr;
 

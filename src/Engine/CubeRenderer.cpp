@@ -181,7 +181,7 @@ bool CubeRenderer::Initialize(ID3D11Device* device) {
     return true;
 }
 
-void CubeRenderer::Render(ID3D11DeviceContext* context, XMMATRIX viewProjection, XMFLOAT3 position, XMFLOAT3 scale, XMFLOAT4 color, ID3D11ShaderResourceView* texture, XMFLOAT3 cameraPos, int hoverState, XMMATRIX viewMatrix, float radius) {
+void CubeRenderer::Render(ID3D11DeviceContext* context, XMMATRIX viewProjection, XMFLOAT3 position, XMFLOAT3 scale, XMFLOAT4 color, ID3D11ShaderResourceView* texture, XMFLOAT3 cameraPos, int hoverState, XMMATRIX viewMatrix, float radius, float spinAngle, float orbitAngle, float tiltAngle) {
     XMMATRIX world;
     if (hoverState == 4 || hoverState == 5) {
         // 画布永远平行于视野
@@ -196,7 +196,22 @@ void CubeRenderer::Render(ID3D11DeviceContext* context, XMMATRIX viewProjection,
                 XMMatrixTranslation(position.x, position.y, position.z);
     } else {
         float angleY = atan2(position.x - cameraPos.x, position.z - cameraPos.z);
-        world = XMMatrixScaling(scale.x, scale.y, scale.z) * XMMatrixRotationY(angleY) * XMMatrixTranslation(position.x, position.y, position.z);
+        float orbitOffset = 0.04f * scale.x;
+        XMFLOAT3 orbitPos = position;
+        if (orbitAngle != 0.0f) {
+            orbitPos.x += cosf(orbitAngle) * orbitOffset;
+            orbitPos.z += sinf(orbitAngle) * orbitOffset;
+        }
+        XMVECTOR spinAxis = XMVectorSet(cosf(orbitAngle) * 0.6f, 0.8f, sinf(orbitAngle) * 0.6f, 0.0f);
+        spinAxis = XMVector3Normalize(spinAxis);
+        XMMATRIX spinRot = (spinAngle != 0.0f) ? XMMatrixRotationAxis(spinAxis, spinAngle) : XMMatrixIdentity();
+        XMMATRIX tiltRot = (tiltAngle != 0.0f) ? XMMatrixRotationX(tiltAngle) : XMMatrixIdentity();
+        XMMATRIX faceRot = XMMatrixRotationY(angleY);
+        world = XMMatrixScaling(scale.x, scale.y, scale.z) *
+                spinRot *
+                tiltRot *
+                faceRot *
+                XMMatrixTranslation(orbitPos.x, orbitPos.y, orbitPos.z);
     }
 
     XMVECTOR det; XMMATRIX invWorld = XMMatrixInverse(&det, world);

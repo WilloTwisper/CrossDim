@@ -20,7 +20,10 @@ public:
                 DirectX::XMFLOAT3 cameraPos,
                 int hoverState,
                 DirectX::XMMATRIX viewMatrix,
-                float radius = 8.0f); 
+                float radius = 8.0f,
+                float spinAngle = 0.0f,
+                float orbitAngle = 0.0f,
+                float tiltAngle = 0.0f); 
 
 private:
     ID3D11VertexShader* m_vertexShader;

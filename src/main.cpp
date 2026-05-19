@@ -4,6 +4,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
 #include <d3d11.h>
 #include <DirectXCollision.h>
 #include <string>
@@ -11,11 +13,18 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
+#include <unordered_map>
+#include <cwchar>
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <imm.h>
 #include <iphlpapi.h>
+
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000
+#endif
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -38,12 +47,18 @@ bool g_uiUnlocked = false;
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 ID3D11Device*           g_pd3dDevice = nullptr;
 ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
 IDXGISwapChain*         g_pSwapChain = nullptr;
 ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 ID3D11DepthStencilView* g_mainDepthStencilView = nullptr;
+HWND g_mainHwnd = nullptr;
+RECT g_taskbarRect = { 0, 0, 0, 0 };
+bool g_taskbarRectValid = false;
+bool g_systemTaskbarHidden = false;
+bool g_tabHotkeyRegistered = false;
 
 float g_mouseDeltaX = 0.0f;
 float g_mouseDeltaY = 0.0f;
@@ -67,8 +82,19 @@ float g_dragPrevRawYaw = 0.0f;
 struct PendingHijack {
     HWND originalFocus;
     int frameWait;
+    DWORD processId;
 };
 std::vector<PendingHijack> g_pendingHijacks;
+
+struct HijackedWindow {
+    HWND hwnd;
+};
+std::vector<HijackedWindow> g_hijackedWindows;
+
+std::unordered_map<std::wstring, ID3D11ShaderResourceView*> g_taskbarIconCache;
+std::unordered_map<HWND, ID3D11ShaderResourceView*> g_taskbarWindowIconCache;
+std::unordered_map<HWND, int> g_taskbarDynamicOrder;
+int g_taskbarDynamicOrderCounter = 1;
 
 IAudioEndpointVolume* g_audioEndpoint = nullptr;
 
@@ -155,6 +181,33 @@ void GetImeLabel(HWND hwnd, char* buffer, size_t bufferSize) {
     ImmReleaseContext(hwnd, imc);
 }
 
+static bool GetImeOpenStatus(HWND hwnd) {
+    HIMC imc = ImmGetContext(hwnd);
+    if (!imc) return false;
+    BOOL open = ImmGetOpenStatus(imc);
+    ImmReleaseContext(hwnd, imc);
+    return open != FALSE;
+}
+
+static void SetImeOpenStatus(HWND hwnd, bool open) {
+    HIMC imc = ImmGetContext(hwnd);
+    if (!imc) return;
+    ImmSetOpenStatus(imc, open ? TRUE : FALSE);
+    ImmReleaseContext(hwnd, imc);
+}
+
+static bool IsChineseImeLayout() {
+    HKL hkl = GetKeyboardLayout(0);
+    LANGID lang = LOWORD((UINT_PTR)hkl);
+    return PRIMARYLANGID(lang) == LANG_CHINESE;
+}
+
+static void ActivateImeLayout(HWND hwnd, LPCWSTR klid, bool open) {
+    HKL hkl = LoadKeyboardLayoutW(klid, KLF_ACTIVATE);
+    if (hkl) ActivateKeyboardLayout(hkl, 0);
+    SetImeOpenStatus(hwnd, open);
+}
+
 struct NetworkStatus {
     bool connected;
     bool wifi;
@@ -187,6 +240,174 @@ NetworkStatus GetNetworkStatus() {
         }
     }
     return status;
+}
+
+struct RunningWindow {
+    HWND hwnd;
+    DWORD pid;
+    std::wstring path;
+    std::wstring title;
+};
+
+struct WindowEnumContext {
+    HWND exclude;
+    std::vector<RunningWindow>* out;
+};
+
+static std::wstring GetProcessPath(DWORD pid) {
+    std::wstring path;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProc) return path;
+    WCHAR buffer[MAX_PATH];
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(hProc, 0, buffer, &size)) {
+        path.assign(buffer, size);
+    }
+    CloseHandle(hProc);
+    return path;
+}
+
+static bool IsTaskbarWindowCandidate(HWND hwnd, HWND exclude) {
+    if (!IsWindowVisible(hwnd)) return false;
+    if (hwnd == exclude) return false;
+    if (GetWindow(hwnd, GW_OWNER) != NULL) return false;
+    LONG style = GetWindowLong(hwnd, GWL_STYLE);
+    if (style & WS_CHILD) return false;
+    LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+    if (exStyle & WS_EX_NOACTIVATE) return false;
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
+    char className[256];
+    GetClassNameA(hwnd, className, 256);
+    if (strcmp(className, "Shell_TrayWnd") == 0 || strcmp(className, "Progman") == 0) return false;
+    WCHAR title[256];
+    if (GetWindowTextW(hwnd, title, 256) == 0) return false;
+    return true;
+}
+
+static BOOL CALLBACK EnumRunningWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto ctx = reinterpret_cast<WindowEnumContext*>(lParam);
+    if (!IsTaskbarWindowCandidate(hwnd, ctx->exclude)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return TRUE;
+
+    RunningWindow win = {};
+    win.hwnd = hwnd;
+    win.pid = pid;
+    win.path = GetProcessPath(pid);
+    WCHAR title[256];
+    GetWindowTextW(hwnd, title, 256);
+    win.title = title;
+    ctx->out->push_back(win);
+    return TRUE;
+}
+
+static std::vector<RunningWindow> EnumerateRunningWindows(HWND exclude) {
+    std::vector<RunningWindow> out;
+    WindowEnumContext ctx = { exclude, &out };
+    EnumWindows(EnumRunningWindowsProc, (LPARAM)&ctx);
+    return out;
+}
+
+static bool IsSamePath(const std::wstring& a, const std::wstring& b) {
+    if (a.empty() || b.empty()) return false;
+    if (_wcsicmp(a.c_str(), b.c_str()) == 0) return true;
+    size_t posA = a.rfind(L'\\');
+    size_t posB = b.rfind(L'\\');
+    if (posA != std::wstring::npos && posB != std::wstring::npos) {
+        return _wcsicmp(a.c_str() + posA, b.c_str() + posB) == 0;
+    }
+    return false;
+}
+
+struct FindHwndCtx { std::wstring exe; HWND result; };
+static BOOL CALLBACK FindHwndByExeProc(HWND hwnd, LPARAM lParam) {
+    FindHwndCtx* ctx = reinterpret_cast<FindHwndCtx*>(lParam);
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return TRUE;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return TRUE;
+    WCHAR buf[MAX_PATH];
+    DWORD sz = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(hProc, 0, buf, &sz);
+    CloseHandle(hProc);
+    if (!ok) return TRUE;
+    std::wstring p(buf, sz);
+    size_t pos = p.rfind(L'\\');
+    if (pos != std::wstring::npos && _wcsicmp(p.c_str() + pos, ctx->exe.c_str()) == 0) {
+        ctx->result = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+static HWND FindRunningHwnd(const std::wstring& appPath) {
+    size_t pos = appPath.rfind(L'\\');
+    std::wstring exe = (pos != std::wstring::npos) ? appPath.substr(pos) : appPath;
+    FindHwndCtx ctx = { exe, nullptr };
+    EnumWindows(FindHwndByExeProc, (LPARAM)&ctx);
+    return ctx.result;
+}
+
+static ID3D11ShaderResourceView* GetTaskbarIcon(ID3D11Device* device, const std::wstring& path) {
+    if (path.empty() || !device) return nullptr;
+    auto it = g_taskbarIconCache.find(path);
+    if (it != g_taskbarIconCache.end()) return it->second;
+    ID3D11ShaderResourceView* icon = TextureLoader::LoadIconFromExe(device, path.c_str());
+    g_taskbarIconCache[path] = icon;
+    return icon;
+}
+
+static void SetSystemTaskbarVisible(bool visible) {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (tray) ShowWindow(tray, visible ? SW_SHOW : SW_HIDE);
+    HWND secondary = nullptr;
+    while (true) {
+        secondary = FindWindowExW(nullptr, secondary, L"Shell_SecondaryTrayWnd", nullptr);
+        if (!secondary) break;
+        ShowWindow(secondary, visible ? SW_SHOW : SW_HIDE);
+    }
+    g_systemTaskbarHidden = !visible;
+}
+
+static HICON GetWindowBestIcon(HWND hwnd) {
+    if (!hwnd) return nullptr;
+    HICON hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
+    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
+    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
+    return hIcon;
+}
+
+static ID3D11ShaderResourceView* GetWindowIconTexture(ID3D11Device* device, HWND hwnd, const std::wstring& path) {
+    if (!device || !hwnd) return GetTaskbarIcon(device, path);
+    auto it = g_taskbarWindowIconCache.find(hwnd);
+    if (it != g_taskbarWindowIconCache.end() && it->second) return it->second;
+    ID3D11ShaderResourceView* icon = nullptr;
+    HICON hIcon = GetWindowBestIcon(hwnd);
+    if (hIcon) {
+        icon = TextureLoader::LoadIconFromHandle(device, hIcon);
+    }
+    if (!icon && !path.empty()) {
+        icon = GetTaskbarIcon(device, path);
+    }
+    if (!icon) {
+        HICON fallback = (HICON)LoadImageW(NULL, reinterpret_cast<LPCWSTR>(ULONG_PTR(32512)), IMAGE_ICON, 0, 0,
+                                           LR_DEFAULTSIZE | LR_SHARED);
+        if (fallback) {
+            icon = TextureLoader::LoadIconFromHandle(device, fallback);
+        }
+    }
+    if (icon) {
+        g_taskbarWindowIconCache[hwnd] = icon;
+    } else if (it != g_taskbarWindowIconCache.end()) {
+        g_taskbarWindowIconCache.erase(it);
+    }
+    return icon;
 }
 
 struct AppCube {
@@ -297,22 +518,91 @@ void CleanupDevice() {
 
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto toggleUiUnlock = [&](HWND hwnd) {
+        g_uiUnlocked = !g_uiUnlocked;
+        if (g_uiUnlocked) {
+            while (ShowCursor(TRUE) < 0);
+            ClipCursor(NULL);
+        } else {
+            while (ShowCursor(FALSE) >= 0);
+
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            MapWindowPoints(hwnd, nullptr, (POINT*)&rect, 2);
+            ClipCursor(&rect);
+            SetCursorPos(rect.left + (rect.right - rect.left) / 2,
+                         rect.top + (rect.bottom - rect.top) / 2);
+        }
+    };
+
+    if (msg == WM_HOTKEY && wParam == 1) {
+        toggleUiUnlock(hWnd);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
+        toggleUiUnlock(hWnd);
+        return 0;
+    }
+
+    bool imguiHandled = false;
     if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
-        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        imguiHandled = ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+        if (imguiHandled && msg != WM_LBUTTONDOWN) {
+            if ((msg == WM_KEYDOWN || msg == WM_KEYUP) && (wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT)) {
+                return DefWindowProc(hWnd, msg, wParam, lParam);
+            }
             return true;
+        }
     }
 
     switch (msg) {
+        case WM_NCHITTEST: {
+            if (g_uiUnlocked) {
+                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                if (g_taskbarRectValid && PtInRect(&g_taskbarRect, pt)) {
+                    return HTCLIENT;
+                }
+                if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
+                    return HTCLIENT;
+                }
+                for (const auto& win : g_hijackedWindows) {
+                    if (!IsWindowVisible(win.hwnd)) continue;
+                    RECT r; GetWindowRect(win.hwnd, &r);
+                    if (PtInRect(&r, pt)) {
+                        float barHeight = 30.0f;
+                        float btnSize = 14.0f;
+                        float btnGap = 8.0f;
+                        float btnPad = 10.0f;
+                        float ctrlWidth = btnSize * 3.0f + btnGap * 2.0f;
+                        RECT btnRect = { (LONG)(r.right - (LONG)(btnPad + ctrlWidth)), r.top, (LONG)(r.right - btnPad), (LONG)(r.top + barHeight) };
+                        if (PtInRect(&btnRect, pt)) return HTCLIENT;
+                        return HTTRANSPARENT;
+                    }
+                }
+            }
+            break;
+        }
         case WM_LBUTTONDOWN: {
-            if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
+            if (g_currentState == STATE_3D_EXPLORE) {
                 g_leftClicked = true;
             } 
             else if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
-                // 让 ImGui 先处理事件
-                bool imguiConsumed = ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
-                // 只有在 ImGui 没有消费事件且用户明确要求时才切换（通过其他方式，如按 TAB 键）
-                // 点击不再自动切换，避免误触
-                if (!imguiConsumed) {
+                bool wantsCapture = ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse;
+                if (!wantsCapture) {
+                    if (g_uiUnlocked) {
+                        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                        bool inHijacked = false;
+                        for (const auto& win : g_hijackedWindows) {
+                            if (!IsWindowVisible(win.hwnd)) continue;
+                            RECT r; GetWindowRect(win.hwnd, &r);
+                            if (PtInRect(&r, pt)) { inHijacked = true; break; }
+                        }
+                        if (!inHijacked) {
+                            g_leftClicked = true;
+                        }
+                    } else {
+                        g_leftClicked = true;
+                    }
                     // 点击在 ImGui 窗口外部时的处理可选择性地切换
                     // 目前保留 ImGui 优先权，确保调参不会被中断
                 }
@@ -336,22 +626,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_KEYDOWN: 
             if (wParam == VK_ESCAPE) PostQuitMessage(0);
-            if (wParam == VK_TAB) {
-                g_uiUnlocked = !g_uiUnlocked;
-                if (g_uiUnlocked) {
-                    while (ShowCursor(TRUE) < 0);
-                    ClipCursor(NULL);
-                } else {
-                    while (ShowCursor(FALSE) >= 0);
-                    
-                    RECT rect;
-                    GetClientRect(hWnd, &rect);
-                    MapWindowPoints(hWnd, nullptr, (POINT*)&rect, 2);
-                    ClipCursor(&rect);
-                    SetCursorPos(rect.left + (rect.right - rect.left) / 2,
-                                 rect.top + (rect.bottom - rect.top) / 2);
-                }
-            }
             return 0;
 
         case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -377,6 +651,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                                 WS_POPUP | WS_VISIBLE, 
                                 0, 0, screenW, screenH, 
                                 nullptr, nullptr, wc.hInstance, nullptr);
+    g_mainHwnd = hwnd;
+    g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
+    SetSystemTaskbarVisible(false);
     RAWINPUTDEVICE rid[1];
     rid[0].usUsagePage = 0x01;
     rid[0].usUsage = 0x02;
@@ -437,6 +714,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (dt < 0.0f) dt = 0.0f;
         if (dt > 0.1f) dt = 0.1f;
         lastTick = nowTick;
+        static float appSpinTime = 0.0f;
+        appSpinTime += dt;
 
         const float sceneFov = 90.0f;
         float mouseMag = fabsf(g_mouseDeltaX) + fabsf(g_mouseDeltaY);
@@ -487,28 +766,28 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
         for (auto it = g_pendingHijacks.begin(); it != g_pendingHijacks.end(); ) {
             it->frameWait++;
-            HWND fgHwnd = GetForegroundWindow();
-            if (fgHwnd != NULL && fgHwnd != hwnd && fgHwnd != it->originalFocus) {
-                char className[256];
-                GetClassNameA(fgHwnd, className, 256);
-                if (strcmp(className, "Shell_TrayWnd") != 0 && strcmp(className, "Progman") != 0) {
-                    LONG style = GetWindowLong(fgHwnd, GWL_STYLE);
-                    if ((style & WS_CAPTION) == WS_CAPTION) {
-                        OutputDebugStringW(L"[成功] 捕获到目标弹出的窗口！实施扒衣！\n");
-                        style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
-                        SetWindowLong(fgHwnd, GWL_STYLE, style);
-                        LONG exStyle = GetWindowLong(fgHwnd, GWL_EXSTYLE);
-                        SetWindowLong(fgHwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-                        SetLayeredWindowAttributes(fgHwnd, 0, 230, LWA_ALPHA);
-                        RECT winRect; GetWindowRect(hwnd, &winRect);
-                        int w = 1100; int h = 750; 
-                        int x = winRect.left + (winRect.right - winRect.left - w) / 2;
-                        int y = winRect.top + (winRect.bottom - winRect.top - h) / 2;
-                        SetWindowPos(fgHwnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            HWND target = FindWindowFromProcessId(it->processId);
+            if (target != NULL && target != hwnd && target != it->originalFocus) {
+                LONG style = GetWindowLong(target, GWL_STYLE);
+                if ((style & WS_CAPTION) == WS_CAPTION) {
+                    OutputDebugStringW(L"[成功] 捕获到目标弹出的窗口！实施扒衣！\n");
+                    style &= ~(WS_CAPTION | WS_SYSMENU);
+                    style |= WS_THICKFRAME;
+                    SetWindowLong(target, GWL_STYLE, style);
+                    RECT winRect; GetWindowRect(hwnd, &winRect);
+                    int w = 1100; int h = 750; 
+                    int x = winRect.left + (winRect.right - winRect.left - w) / 2;
+                    int y = winRect.top + (winRect.bottom - winRect.top - h) / 2;
+                    SetWindowPos(target, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW | SWP_FRAMECHANGED);
 
-                        it = g_pendingHijacks.erase(it);
-                        continue;
+                    bool exists = false;
+                    for (const auto& win : g_hijackedWindows) {
+                        if (win.hwnd == target) { exists = true; break; }
                     }
+                    if (!exists) g_hijackedWindows.push_back({ target });
+
+                    it = g_pendingHijacks.erase(it);
+                    continue;
                 }
             }
             
@@ -541,38 +820,125 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 TASKBAR_ICON_SEARCH = 1,
                 TASKBAR_ICON_APP = 2
             };
-            struct TaskbarApp {
-                const char* Id;
-                const char* Label;
-                LPCWSTR AppPath;
+            struct TaskbarEntry {
+                std::string Id;
+                std::string Label;
+                std::wstring AppPath;
                 ImU32 Accent;
                 TaskbarAction Action;
                 TaskbarIconKind IconKind;
                 ID3D11ShaderResourceView* Icon;
+                bool Pinned;
+                bool Running;
+                HWND Hwnd;
+                DWORD Pid;
             };
-            static TaskbarApp taskbarApps[] = {
-                { "Taskbar.Start",  "Start",  nullptr, IM_COL32(70, 140, 230, 255), TASKBAR_ACTION_START, TASKBAR_ICON_WINDOWS, nullptr },
-                { "Taskbar.Search", "Search", nullptr, IM_COL32(120, 170, 255, 255), TASKBAR_ACTION_NONE,  TASKBAR_ICON_SEARCH, nullptr },
-                { "Taskbar.Files",  "Files",  L"C:\\Windows\\explorer.exe", IM_COL32(255, 210, 120, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr },
-                { "Taskbar.Edge",   "Edge",   L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", IM_COL32(120, 210, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr },
-                { "Taskbar.Terminal", "Terminal", L"C:\\Windows\\System32\\cmd.exe", IM_COL32(140, 255, 170, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr },
-                { "Taskbar.Code",   "Code",   L"D:\\Apps\\Microsoft VS Code\\Code.exe", IM_COL32(120, 185, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr }
-            };
-            static int taskbarActive = -1;
+            static std::vector<TaskbarEntry> taskbarPinned;
             static bool taskbarStartOpen = false;
             static bool taskbarTrayOpen = false;
-            static bool taskbarIconsLoaded = false;
+            static bool taskbarPinnedInit = false;
+            if (!taskbarPinnedInit) {
+                taskbarPinned = {
+                    { "Taskbar.Start",  "Start",  L"", IM_COL32(0, 140, 255, 255), TASKBAR_ACTION_START, TASKBAR_ICON_WINDOWS, nullptr, true, false, nullptr, 0 },
+                    { "Taskbar.Search", "Search", L"", IM_COL32(120, 170, 255, 255), TASKBAR_ACTION_NONE,  TASKBAR_ICON_SEARCH, nullptr, true, false, nullptr, 0 },
+                    { "Taskbar.Files",  "Files",  L"C:\\Windows\\explorer.exe", IM_COL32(255, 210, 120, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                    { "Taskbar.Edge",   "Edge",   L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", IM_COL32(120, 210, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                    { "Taskbar.Terminal", "Terminal", L"C:\\Windows\\System32\\cmd.exe", IM_COL32(140, 255, 170, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                    { "Taskbar.Code",   "Code",   L"D:\\Apps\\Microsoft VS Code\\Code.exe", IM_COL32(120, 185, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 }
+                };
+                taskbarPinnedInit = true;
+            }
 
-            const int taskbarAppCount = (int)(sizeof(taskbarApps) / sizeof(taskbarApps[0]));
-            if (!taskbarIconsLoaded) {
-                for (int i = 0; i < taskbarAppCount; ++i) {
-                    if (taskbarApps[i].IconKind == TASKBAR_ICON_APP && taskbarApps[i].AppPath) {
-                        taskbarApps[i].Icon = TextureLoader::LoadIconFromExe(g_pd3dDevice, taskbarApps[i].AppPath);
+            for (auto& entry : taskbarPinned) {
+                if (entry.IconKind == TASKBAR_ICON_APP && entry.Icon == nullptr && !entry.AppPath.empty()) {
+                    entry.Icon = GetTaskbarIcon(g_pd3dDevice, entry.AppPath);
+                }
+                entry.Running = false;
+                entry.Hwnd = nullptr;
+                entry.Pid = 0;
+            }
+
+            std::vector<RunningWindow> runningWindows = EnumerateRunningWindows(g_mainHwnd);
+            for (const auto& win : runningWindows) {
+                if (g_taskbarDynamicOrder.find(win.hwnd) == g_taskbarDynamicOrder.end()) {
+                    g_taskbarDynamicOrder[win.hwnd] = g_taskbarDynamicOrderCounter++;
+                }
+            }
+            for (auto it = g_taskbarDynamicOrder.begin(); it != g_taskbarDynamicOrder.end(); ) {
+                bool alive = false;
+                for (const auto& win : runningWindows) {
+                    if (win.hwnd == it->first) { alive = true; break; }
+                }
+                if (!alive) it = g_taskbarDynamicOrder.erase(it);
+                else ++it;
+            }
+            std::sort(runningWindows.begin(), runningWindows.end(), [&](const RunningWindow& a, const RunningWindow& b) {
+                int orderA = 0;
+                int orderB = 0;
+                auto itA = g_taskbarDynamicOrder.find(a.hwnd);
+                auto itB = g_taskbarDynamicOrder.find(b.hwnd);
+                if (itA != g_taskbarDynamicOrder.end()) orderA = itA->second;
+                if (itB != g_taskbarDynamicOrder.end()) orderB = itB->second;
+                return orderA < orderB;
+            });
+            HWND fgWindow = GetForegroundWindow();
+            for (auto& pinned : taskbarPinned) {
+                if (pinned.IconKind == TASKBAR_ICON_APP) {
+                    pinned.Running = false;
+                    pinned.Hwnd = nullptr;
+                    pinned.Pid = 0;
+                }
+            }
+            std::vector<TaskbarEntry> taskbarDynamic;
+            taskbarDynamic.reserve(runningWindows.size());
+            for (const auto& win : runningWindows) {
+                bool matched = false;
+                for (auto& pinned : taskbarPinned) {
+                    if (pinned.IconKind == TASKBAR_ICON_APP && IsSamePath(win.path, pinned.AppPath)) {
+                        pinned.Running = true;
+                        if (pinned.Hwnd == nullptr || win.hwnd == fgWindow) {
+                            pinned.Hwnd = win.hwnd;
+                            pinned.Pid = win.pid;
+                        }
+                        matched = true;
+                        break;
                     }
                 }
-                taskbarIconsLoaded = true;
+                if (!matched) {
+                    TaskbarEntry dyn = {};
+                    char idBuffer[64];
+                    sprintf_s(idBuffer, "Taskbar.Run.%p", win.hwnd);
+                    dyn.Id = idBuffer;
+                    dyn.Label = "Running";
+                    dyn.AppPath = win.path;
+                    dyn.Accent = IM_COL32(120, 185, 255, 255);
+                    dyn.Action = TASKBAR_ACTION_NONE;
+                    dyn.IconKind = TASKBAR_ICON_APP;
+                    dyn.Icon = GetWindowIconTexture(g_pd3dDevice, win.hwnd, win.path);
+                    dyn.Pinned = false;
+                    dyn.Running = true;
+                    dyn.Hwnd = win.hwnd;
+                    dyn.Pid = win.pid;
+                    taskbarDynamic.push_back(dyn);
+                }
             }
-            float iconSize = 28.0f;
+            for (auto& pinned : taskbarPinned) {
+                if (pinned.IconKind == TASKBAR_ICON_APP && !pinned.Running) {
+                    HWND found = FindRunningHwnd(pinned.AppPath);
+                    if (found) {
+                        pinned.Running = true;
+                        pinned.Hwnd = found;
+                    }
+                }
+            }
+
+            std::vector<TaskbarEntry*> taskbarEntries;
+            taskbarEntries.reserve(taskbarPinned.size() + taskbarDynamic.size());
+            for (auto& pinned : taskbarPinned) taskbarEntries.push_back(&pinned);
+            for (auto& dyn : taskbarDynamic) taskbarEntries.push_back(&dyn);
+
+            const int taskbarAppCount = (int)taskbarEntries.size();
+            float iconSize = 32.0f;
             float iconGap = 12.0f;
             float paddingX = 18.0f;
             float paddingY = 8.0f;
@@ -587,8 +953,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             sprintf_s(timeText, "%02u:%02u", st.wHour, st.wMinute);
             sprintf_s(dateText, "%04u/%02u/%02u", st.wYear, st.wMonth, st.wDay);
 
-            char imeText[16];
-            GetImeLabel(hwnd, imeText, sizeof(imeText));
+            bool imeOpen = GetImeOpenStatus(hwnd);
+            bool imeChinese = IsChineseImeLayout();
+            const char* imeLeft = imeChinese ? (imeOpen ? "中" : "英") : "";
+            const char* imeRight = imeChinese ? "拼" : "ENG";
             NetworkStatus netStatus = GetNetworkStatus();
             bool netConnected = netStatus.connected;
             bool netWifi = netStatus.wifi || !netStatus.ethernet;
@@ -610,14 +978,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
             float trayIconBox = 16.0f;
             float trayGap = 10.0f;
-            ImVec2 imeSize = ImGui::CalcTextSize(imeText);
+            ImVec2 imeLeftSize = ImGui::CalcTextSize(imeLeft);
+            ImVec2 imeRightSize = ImGui::CalcTextSize(imeRight);
+            float imeGap = 10.0f;
+            float imeBlockWidth = (imeLeftSize.x > 0.0f ? imeLeftSize.x + imeGap : 0.0f) + imeRightSize.x;
             ImVec2 chevronSize = ImGui::CalcTextSize("^");
-            float rightAreaWidth = chevronSize.x + imeSize.x + timeBlockWidth + trayIconBox * 3.0f + trayGap * 5.0f;
+            float rightAreaWidth = chevronSize.x + imeBlockWidth + timeBlockWidth + trayIconBox * 3.0f + trayGap * 5.0f;
 
             ImVec2 barPos = ImVec2(
                 viewport->WorkPos.x,
                 viewport->WorkPos.y + viewport->WorkSize.y - barHeight
             );
+            g_taskbarRect.left = (LONG)barPos.x;
+            g_taskbarRect.top = (LONG)barPos.y;
+            g_taskbarRect.right = (LONG)(barPos.x + barWidth);
+            g_taskbarRect.bottom = (LONG)(barPos.y + barHeight);
+            g_taskbarRectValid = true;
 
             ImGui::SetNextWindowPos(barPos);
             ImGui::SetNextWindowSize(ImVec2(barWidth, barHeight));
@@ -638,31 +1014,29 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             draw->AddLine(ImVec2(p0.x, p1.y - 1.0f), ImVec2(p1.x, p1.y - 1.0f), IM_COL32(0, 0, 0, 18), 1.0f);
 
             auto launchTaskbarApp = [&](LPCWSTR appPath) {
-                if (!appPath) return;
+                if (!appPath || appPath[0] == L'\0') return;
                 WCHAR cmdBuffer[MAX_PATH];
                 wcscpy_s(cmdBuffer, appPath);
                 STARTUPINFOW si = { sizeof(si) };
                 PROCESS_INFORMATION pi;
                 if (CreateProcessW(NULL, cmdBuffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
                     HWND currentFocus = GetForegroundWindow();
-                    g_pendingHijacks.push_back({ currentFocus, 0 });
+                    g_pendingHijacks.push_back({ currentFocus, 0, pi.dwProcessId });
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
+                    SetSystemTaskbarVisible(false);
                 }
             };
 
             auto drawWindowsGlyph = [&](ImVec2 a, ImVec2 b, ImU32 color) {
                 float w = b.x - a.x;
-                float gap = w * 0.08f;
-                float tile = (w - gap) * 0.5f;
-                ImVec2 tl = ImVec2(a.x, a.y);
-                ImVec2 tr = ImVec2(a.x + tile + gap, a.y);
-                ImVec2 bl = ImVec2(a.x, a.y + tile + gap);
-                ImVec2 br = ImVec2(a.x + tile + gap, a.y + tile + gap);
-                draw->AddRectFilled(tl, ImVec2(tl.x + tile, tl.y + tile), color, 2.0f);
-                draw->AddRectFilled(tr, ImVec2(tr.x + tile, tr.y + tile), color, 2.0f);
-                draw->AddRectFilled(bl, ImVec2(bl.x + tile, bl.y + tile), color, 2.0f);
-                draw->AddRectFilled(br, ImVec2(br.x + tile, br.y + tile), color, 2.0f);
+                float r = w * 0.08f;
+                draw->AddRectFilled(a, b, color, r);
+                float cx = (a.x + b.x) * 0.5f;
+                float cy = (a.y + b.y) * 0.5f;
+                ImU32 lineColor = IM_COL32(255, 255, 255, 230);
+                draw->AddLine(ImVec2(cx, a.y), ImVec2(cx, b.y), lineColor, 1.6f);
+                draw->AddLine(ImVec2(a.x, cy), ImVec2(b.x, cy), lineColor, 1.6f);
             };
 
             auto drawSearchGlyph = [&](ImVec2 center, float size, ImU32 color) {
@@ -698,8 +1072,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     ImVec2 boltB = ImVec2(bodyMin.x + w * 0.6f, pos.y + h * 0.45f);
                     ImVec2 boltC = ImVec2(bodyMin.x + w * 0.5f, pos.y + h * 0.45f);
                     ImVec2 boltD = ImVec2(bodyMin.x + w * 0.63f, pos.y + h * 0.8f);
-                    draw->AddTriangleFilled(boltA, boltB, boltC, IM_COL32(255, 200, 80, 220));
-                    draw->AddTriangleFilled(boltB, boltC, boltD, IM_COL32(255, 200, 80, 220));
+                    draw->AddTriangleFilled(boltA, boltB, boltC, IM_COL32(180, 255, 180, 230));
+                    draw->AddTriangleFilled(boltB, boltC, boltD, IM_COL32(180, 255, 180, 230));
                 }
             };
 
@@ -739,98 +1113,186 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             float centerAreaLeft = p0.x + paddingX;
             float centerAreaRight = p1.x - paddingX - rightAreaWidth;
             float centerAreaWidth = centerAreaRight - centerAreaLeft;
-            float iconRowWidth = taskbarAppCount * iconSize + (taskbarAppCount - 1) * iconGap;
+            float iconRowWidth = taskbarAppCount * iconSize +
+                                 (taskbarAppCount > 1 ? (taskbarAppCount - 1) * iconGap : 0.0f);
             float iconScale = 1.0f;
             if (centerAreaWidth > 0.0f && iconRowWidth > centerAreaWidth) {
                 iconScale = centerAreaWidth / iconRowWidth;
             }
             float drawIconSize = iconSize * iconScale;
             float drawIconGap = iconGap * iconScale;
-            float drawRowWidth = taskbarAppCount * drawIconSize + (taskbarAppCount - 1) * drawIconGap;
+            float drawRowWidth = taskbarAppCount * drawIconSize + (taskbarAppCount > 1 ? (taskbarAppCount - 1) * drawIconGap : 0.0f);
+
+            for (auto& pinned : taskbarPinned) {
+                if (pinned.Running && pinned.Hwnd) {
+                    pinned.Icon = GetWindowIconTexture(g_pd3dDevice, pinned.Hwnd, pinned.AppPath);
+                }
+            }
             if (centerAreaWidth < 0.0f) centerAreaWidth = 0.0f;
 
             ImVec2 cursor = ImVec2(
                 centerAreaLeft + (centerAreaWidth - drawRowWidth) * 0.5f,
                 p0.y + (barHeight - drawIconSize) * 0.5f
             );
+            float rowStartX = cursor.x;
+            static int dragPinnedIndex = -1;
+            static int dragDynamicIndex = -1;
+            static ImGuiID dragItemId = 0;
+            static bool dragItemMoved = false;
+            static ImVec2 dragMouseStart = ImVec2(0, 0);
+            const int pinnedCount = (int)taskbarPinned.size();
+            const int dynamicCount = (int)taskbarDynamic.size();
             for (int i = 0; i < taskbarAppCount; ++i) {
                 ImVec2 iconPos = ImVec2(cursor.x + i * (drawIconSize + drawIconGap), cursor.y);
                 ImGui::SetCursorScreenPos(iconPos);
-                ImGui::InvisibleButton(taskbarApps[i].Id, ImVec2(drawIconSize, drawIconSize));
+                TaskbarEntry& entry = *taskbarEntries[i];
+                ImGui::InvisibleButton(entry.Id.c_str(), ImVec2(drawIconSize, drawIconSize));
 
-                bool hovered = ImGui::IsItemHovered();
-                bool active = (taskbarActive == i);
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                    if (taskbarApps[i].Action == TASKBAR_ACTION_START) {
-                        if (taskbarStartOpen && taskbarActive == i) {
-                            taskbarStartOpen = false;
-                            taskbarActive = -1;
-                        } else {
-                            taskbarStartOpen = true;
-                            taskbarActive = i;
-                        }
-                    } else if (taskbarApps[i].Action == TASKBAR_ACTION_LAUNCH) {
-                        taskbarStartOpen = false;
-                        taskbarActive = i;
-                        launchTaskbarApp(taskbarApps[i].AppPath);
-                    } else {
-                        taskbarStartOpen = false;
-                        taskbarActive = i;
+                ImGuiID itemId = ImGui::GetItemID();
+                if (ImGui::IsItemActivated()) {
+                    dragItemId = itemId;
+                    dragMouseStart = ImGui::GetIO().MousePos;
+                    dragItemMoved = false;
+                }
+                if (dragItemId == itemId && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !dragItemMoved) {
+                    float dx = ImGui::GetIO().MousePos.x - dragMouseStart.x;
+                    float dy = ImGui::GetIO().MousePos.y - dragMouseStart.y;
+                    if (dx * dx + dy * dy > 6.0f) {
+                        dragItemMoved = true;
                     }
                 }
 
+                bool hovered = ImGui::IsItemHovered();
+                bool isStart = (entry.Action == TASKBAR_ACTION_START);
+                bool isRunning = entry.Running;
+                bool isForeground = (entry.Hwnd != nullptr && entry.Hwnd == fgWindow);
+                bool isActive = isStart ? taskbarStartOpen : isForeground;
+                bool wasDragged = (dragItemMoved && dragItemId == itemId);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !wasDragged) {
+                    if (isStart) {
+                        taskbarStartOpen = !taskbarStartOpen;
+                    } else {
+                        taskbarStartOpen = false;
+                        HWND clickHwnd = (entry.Running && entry.Hwnd) ? entry.Hwnd : FindRunningHwnd(entry.AppPath);
+                        if (clickHwnd) {
+                            entry.Running = true;
+                            entry.Hwnd = clickHwnd;
+                            if (clickHwnd == fgWindow) {
+                                ShowWindow(clickHwnd, SW_MINIMIZE);
+                            } else {
+                                ShowWindow(clickHwnd, SW_RESTORE);
+                                DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+                                DWORD targetThread = GetWindowThreadProcessId(clickHwnd, nullptr);
+                                AttachThreadInput(fgThread, targetThread, TRUE);
+                                SetForegroundWindow(clickHwnd);
+                                AttachThreadInput(fgThread, targetThread, FALSE);
+                            }
+                        } else if (entry.Action == TASKBAR_ACTION_LAUNCH && !entry.AppPath.empty()) {
+                            launchTaskbarApp(entry.AppPath.c_str());
+                        }
+                    }
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Middle) && isRunning && entry.Hwnd) {
+                    PostMessage(entry.Hwnd, WM_CLOSE, 0, 0);
+                }
+
+                if (dragItemMoved && dragItemId == itemId && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    float slot = (ImGui::GetIO().MousePos.x - rowStartX + (drawIconSize * 0.5f)) / (drawIconSize + drawIconGap);
+                    int target = (int)slot;
+                    if (entry.Pinned) {
+                        if (dragPinnedIndex == -1) dragPinnedIndex = i;
+                        if (target < 0) target = 0;
+                        if (target >= pinnedCount) target = pinnedCount - 1;
+                        if (target != dragPinnedIndex && target >= 0 && dragPinnedIndex >= 0 && dragPinnedIndex < pinnedCount) {
+                            std::swap(taskbarPinned[dragPinnedIndex], taskbarPinned[target]);
+                            dragPinnedIndex = target;
+                        }
+                    } else if (dynamicCount > 1) {
+                        int dynIndex = i - pinnedCount;
+                        if (dynIndex >= 0 && dynIndex < dynamicCount) {
+                            if (dragDynamicIndex == -1) dragDynamicIndex = dynIndex;
+                            int targetDyn = target - pinnedCount;
+                            if (targetDyn < 0) targetDyn = 0;
+                            if (targetDyn >= dynamicCount) targetDyn = dynamicCount - 1;
+                            if (targetDyn != dragDynamicIndex && dragDynamicIndex >= 0 && dragDynamicIndex < dynamicCount) {
+                                HWND a = taskbarDynamic[dragDynamicIndex].Hwnd;
+                                HWND b = taskbarDynamic[targetDyn].Hwnd;
+                                auto itA = g_taskbarDynamicOrder.find(a);
+                                auto itB = g_taskbarDynamicOrder.find(b);
+                                if (itA != g_taskbarDynamicOrder.end() && itB != g_taskbarDynamicOrder.end()) {
+                                    std::swap(itA->second, itB->second);
+                                }
+                                std::swap(taskbarDynamic[dragDynamicIndex], taskbarDynamic[targetDyn]);
+                                dragDynamicIndex = targetDyn;
+                            }
+                        }
+                    }
+                }
                 ImVec2 b0 = ImGui::GetItemRectMin();
                 ImVec2 b1 = ImGui::GetItemRectMax();
                 float iconRound = 6.0f * (drawIconSize / 28.0f);
-                ImU32 base = (hovered || active) ? IM_COL32(255, 255, 255, 180) : IM_COL32(255, 255, 255, 0);
+                ImU32 base = (hovered || isActive) ? IM_COL32(255, 255, 255, 180) : IM_COL32(255, 255, 255, 0);
                 if ((base >> 24) > 0) draw->AddRectFilled(b0, b1, base, iconRound);
 
-                bool isAppIcon = (taskbarApps[i].IconKind == TASKBAR_ICON_APP);
-                ImVec4 accent = ImGui::ColorConvertU32ToFloat4(taskbarApps[i].Accent);
-                accent.w = isAppIcon ? (hovered ? 0.08f : 0.04f) : (active ? 0.45f : (hovered ? 0.25f : 0.12f));
-                if (accent.w > 0.001f) {
-                    draw->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(accent), iconRound);
+                bool isAppIcon = (entry.IconKind == TASKBAR_ICON_APP);
+                if (isAppIcon) {
+                    ImVec4 accent = ImGui::ColorConvertU32ToFloat4(entry.Accent);
+                    accent.w = hovered ? 0.08f : 0.04f;
+                    if (accent.w > 0.001f) {
+                        draw->AddRectFilled(b0, b1, ImGui::ColorConvertFloat4ToU32(accent), iconRound);
+                    }
                 }
 
                 ImVec2 center = ImVec2((b0.x + b1.x) * 0.5f, (b0.y + b1.y) * 0.5f);
                 ImVec2 glyphMin = ImVec2(b0.x + drawIconSize * 0.22f, b0.y + drawIconSize * 0.22f);
                 ImVec2 glyphMax = ImVec2(b1.x - drawIconSize * 0.22f, b1.y - drawIconSize * 0.22f);
-                if (taskbarApps[i].IconKind == TASKBAR_ICON_WINDOWS) {
-                    drawWindowsGlyph(glyphMin, glyphMax, taskbarApps[i].Accent);
-                } else if (taskbarApps[i].IconKind == TASKBAR_ICON_SEARCH) {
+                if (entry.IconKind == TASKBAR_ICON_WINDOWS) {
+                    drawWindowsGlyph(glyphMin, glyphMax, entry.Accent);
+                } else if (entry.IconKind == TASKBAR_ICON_SEARCH) {
                     drawSearchGlyph(center, drawIconSize, IM_COL32(30, 40, 60, 210));
                 } else {
-                    ID3D11ShaderResourceView* iconSrv = taskbarApps[i].Icon;
+                    ID3D11ShaderResourceView* iconSrv = entry.Icon;
                     if (iconSrv) {
                         float imgSize = drawIconSize * 0.72f;
                         ImVec2 imgPos = ImVec2(center.x - imgSize * 0.5f, center.y - imgSize * 0.5f);
                         draw->AddImage((ImTextureID)iconSrv, imgPos, ImVec2(imgPos.x + imgSize, imgPos.y + imgSize));
                     } else {
-                        ImVec4 glyphAccent = ImGui::ColorConvertU32ToFloat4(taskbarApps[i].Accent);
+                        ImVec4 glyphAccent = ImGui::ColorConvertU32ToFloat4(entry.Accent);
                         glyphAccent.w = 0.85f;
                         drawAppGlyph(center, drawIconSize, ImGui::ColorConvertFloat4ToU32(glyphAccent));
                     }
                 }
 
-                if (active) {
+                if (isRunning) {
                     ImVec2 dot = ImVec2((b0.x + b1.x) * 0.5f, b1.y + 3.0f);
-                    draw->AddCircleFilled(dot, 2.0f, taskbarApps[i].Accent);
+                    float dotRadius = isForeground ? 2.6f : 2.0f;
+                    ImU32 dotColor = isForeground ? entry.Accent : IM_COL32(120, 140, 190, 220);
+                    draw->AddCircleFilled(dot, dotRadius, dotColor);
                 }
+            }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                dragPinnedIndex = -1;
+                dragDynamicIndex = -1;
+                dragItemId = 0;
+                dragItemMoved = false;
+                dragMouseStart = ImVec2(0, 0);
             }
 
             ImU32 trayColor = IM_COL32(20, 30, 50, 220);
             ImU32 trayMuted = IM_COL32(20, 30, 50, 150);
             ImU32 netColor = netConnected ? trayColor : IM_COL32(20, 30, 50, 110);
             float centerY = p0.y + barHeight * 0.5f;
-            float timeX = p1.x - paddingX - timeBlockWidth;
+            float timeX = p1.x - paddingX - timeSize.x;
+            float dateX = p1.x - paddingX - dateSize.x;
             float timeY = centerY - timeBlockHeight * 0.5f;
             draw->AddText(ImVec2(timeX, timeY), trayColor, timeText);
-            draw->AddText(ImVec2(timeX, timeY + timeSize.y), trayMuted, dateText);
+            draw->AddText(ImVec2(dateX, timeY + timeSize.y), trayMuted, dateText);
 
-            float cursorX = timeX - trayGap;
+            float cursorX = p1.x - paddingX - timeBlockWidth - trayGap;
             float batteryH = trayIconBox * 0.55f;
             cursorX -= trayIconBox;
-            drawBatteryIcon(ImVec2(cursorX, centerY - batteryH * 0.5f), trayIconBox, batteryH, batteryPercent, batteryCharging, trayColor);
+            ImU32 batteryColor = batteryCharging ? IM_COL32(80, 200, 80, 240) : trayColor;
+            drawBatteryIcon(ImVec2(cursorX, centerY - batteryH * 0.5f), trayIconBox, batteryH, batteryPercent, batteryCharging, batteryColor);
 
             cursorX -= trayGap + trayIconBox;
             drawVolumeIcon(ImVec2(cursorX + trayIconBox * 0.5f, centerY), trayIconBox, volumeLevel, trayColor);
@@ -838,8 +1300,47 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             cursorX -= trayGap + trayIconBox;
             drawNetBarsIcon(ImVec2(cursorX + trayIconBox * 0.5f, centerY), trayIconBox, netWifi, netConnected, netColor);
 
-            cursorX -= trayGap + imeSize.x;
-            draw->AddText(ImVec2(cursorX, centerY - imeSize.y * 0.5f), trayColor, imeText);
+            cursorX -= trayGap + imeBlockWidth;
+            ImVec2 imeLeftPos = ImVec2(cursorX, centerY - imeLeftSize.y * 0.5f);
+            ImVec2 imeRightPos = ImVec2(cursorX + imeLeftSize.x + imeGap, centerY - imeRightSize.y * 0.5f);
+
+            bool imeLeftHover = false;
+            if (imeChinese) {
+                ImGui::SetCursorScreenPos(ImVec2(imeLeftPos.x - 3.0f, imeLeftPos.y - 2.0f));
+                ImGui::InvisibleButton("Ime.Left", ImVec2(imeLeftSize.x + 6.0f, imeLeftSize.y + 4.0f));
+                imeLeftHover = ImGui::IsItemHovered();
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    INPUT inputs[2] = {};
+                    inputs[0].type = INPUT_KEYBOARD;
+                    inputs[0].ki.wVk = VK_SHIFT;
+                    inputs[1].type = INPUT_KEYBOARD;
+                    inputs[1].ki.wVk = VK_SHIFT;
+                    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    SendInput(2, inputs, sizeof(INPUT));
+                }
+            }
+
+            ImGui::SetCursorScreenPos(ImVec2(imeRightPos.x - 3.0f, imeRightPos.y - 2.0f));
+            ImGui::InvisibleButton("Ime.Right", ImVec2(imeRightSize.x + 6.0f, imeRightSize.y + 4.0f));
+            bool imeRightHover = ImGui::IsItemHovered();
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                ImGui::OpenPopup("Ime.Menu");
+            }
+
+            ImU32 imeLeftColor = imeLeftHover ? IM_COL32(20, 30, 50, 240) : trayColor;
+            ImU32 imeRightColor = imeRightHover ? IM_COL32(20, 30, 50, 240) : trayColor;
+            draw->AddText(imeLeftPos, imeLeftColor, imeLeft);
+            draw->AddText(imeRightPos, imeRightColor, imeRight);
+
+            if (ImGui::BeginPopup("Ime.Menu")) {
+                if (ImGui::MenuItem("Microsoft Pinyin")) {
+                    ActivateImeLayout(hwnd, L"00000804", true);
+                }
+                if (ImGui::MenuItem("ENG")) {
+                    ActivateImeLayout(hwnd, L"00000409", false);
+                }
+                ImGui::EndPopup();
+            }
 
             cursorX -= trayGap + chevronSize.x;
             ImGui::SetCursorScreenPos(ImVec2(cursorX - 2.0f, centerY - trayIconBox * 0.5f));
@@ -895,30 +1396,75 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImGui::Spacing();
                 ImGui::Text("Pinned");
                 ImGui::Separator();
+                ImGui::Dummy(ImVec2(0.0f, 6.0f * scale));
 
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f * scale);
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f * scale, 8.0f * scale));
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 1.0f, 0.28f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.38f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.48f));
-                if (ImGui::BeginTable("StartPinnedApps", 2, ImGuiTableFlags_SizingStretchSame)) {
-                    const int quickIndices[] = { 2, 3, 4, 5 };
-                    for (int i = 0; i < (int)(sizeof(quickIndices) / sizeof(quickIndices[0])); ++i) {
-                        ImGui::TableNextColumn();
-                        int appIndex = quickIndices[i];
-                        ImGui::PushID(appIndex);
-                        if (ImGui::Button(taskbarApps[appIndex].Label, ImVec2(-1.0f, 36.0f * scale))) {
-                            taskbarStartOpen = false;
-                            taskbarActive = appIndex;
-                            launchTaskbarApp(taskbarApps[appIndex].AppPath);
-                        }
-                        ImGui::PopID();
-                    }
-                    ImGui::EndTable();
+                ImDrawList* startDraw = ImGui::GetWindowDrawList();
+                float tileGap = 10.0f * scale;
+                float tilePad = 4.0f * scale;
+                int tileCols = 4;
+                float tileW = (panelWidth - tilePad * 2.0f - tileGap * (tileCols - 1)) / (float)tileCols;
+                if (tileW < 54.0f * scale) {
+                    tileCols = 3;
+                    tileW = (panelWidth - tilePad * 2.0f - tileGap * (tileCols - 1)) / (float)tileCols;
                 }
-                ImGui::PopStyleColor(3);
-                ImGui::PopStyleVar(2);
-                ImGui::PopStyleColor();
+                float tileH = tileW + 22.0f * scale;
+                ImVec2 gridStart = ImGui::GetCursorScreenPos();
+                float gridX = gridStart.x + tilePad;
+                float gridY = gridStart.y;
+                int gridCol = 0;
+
+                for (int i = 0; i < (int)taskbarPinned.size(); ++i) {
+                    if (taskbarPinned[i].IconKind != TASKBAR_ICON_APP) continue;
+                    ImGui::PushID(i);
+                    ImGui::SetCursorScreenPos(ImVec2(gridX, gridY));
+                    ImGui::InvisibleButton("StartTile", ImVec2(tileW, tileH));
+                    bool hovered = ImGui::IsItemHovered();
+                    bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+
+                    ImVec2 b0 = ImGui::GetItemRectMin();
+                    ImVec2 b1 = ImGui::GetItemRectMax();
+                    ImU32 tileColor = hovered ? IM_COL32(255, 255, 255, 210) : IM_COL32(255, 255, 255, 150);
+                    ImU32 tileBorder = hovered ? IM_COL32(255, 255, 255, 200) : IM_COL32(255, 255, 255, 120);
+                    startDraw->AddRectFilled(b0, b1, tileColor, 12.0f * scale);
+                    startDraw->AddRect(b0, b1, tileBorder, 12.0f * scale, 0, 1.0f);
+
+                    ImVec2 iconCenter = ImVec2((b0.x + b1.x) * 0.5f, b0.y + tileW * 0.45f);
+                    ID3D11ShaderResourceView* iconSrv = taskbarPinned[i].Icon;
+                    if (iconSrv) {
+                        float imgSize = tileW * 0.55f;
+                        ImVec2 imgPos = ImVec2(iconCenter.x - imgSize * 0.5f, iconCenter.y - imgSize * 0.5f);
+                        startDraw->AddImage((ImTextureID)iconSrv, imgPos, ImVec2(imgPos.x + imgSize, imgPos.y + imgSize));
+                    } else {
+                        ImVec4 glyphAccent = ImGui::ColorConvertU32ToFloat4(taskbarPinned[i].Accent);
+                        glyphAccent.w = 0.85f;
+                        drawAppGlyph(iconCenter, tileW * 0.75f, ImGui::ColorConvertFloat4ToU32(glyphAccent));
+                    }
+
+                    const char* label = taskbarPinned[i].Label.c_str();
+                    ImVec2 labelSize = ImGui::CalcTextSize(label);
+                    float labelX = b0.x + (tileW - labelSize.x) * 0.5f;
+                    float labelY = b1.y - labelSize.y - 6.0f * scale;
+                    startDraw->AddText(ImVec2(labelX, labelY), IM_COL32(35, 45, 65, 230), label);
+
+                    if (clicked) {
+                        taskbarStartOpen = false;
+                        if (!taskbarPinned[i].AppPath.empty()) {
+                            launchTaskbarApp(taskbarPinned[i].AppPath.c_str());
+                        }
+                    }
+
+                    ImGui::PopID();
+                    gridCol++;
+                    if (gridCol >= tileCols) {
+                        gridCol = 0;
+                        gridX = gridStart.x + tilePad;
+                        gridY += tileH + tileGap;
+                    } else {
+                        gridX += tileW + tileGap;
+                    }
+                }
+
+                ImGui::SetCursorScreenPos(ImVec2(gridStart.x, gridY + tileH + tileGap));
 
                 ImGui::End();
                 ImGui::PopStyleVar(3);
@@ -957,6 +1503,103 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImGui::End();
                 ImGui::PopStyleVar(3);
             }
+        }
+
+        if (g_uiUnlocked && !g_hijackedWindows.empty()) {
+            ImGuiViewport* viewport = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(viewport->WorkPos);
+            ImGui::SetNextWindowSize(viewport->WorkSize);
+            ImGui::SetNextWindowBgAlpha(0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::Begin("CrossDim WindowChrome", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+            ImDrawList* chromeDraw = ImGui::GetWindowDrawList();
+            static HWND dragHwnd = nullptr;
+            static ImVec2 dragOffset = ImVec2(0.0f, 0.0f);
+            std::vector<HijackedWindow> alive;
+            alive.reserve(g_hijackedWindows.size());
+
+            for (const auto& win : g_hijackedWindows) {
+                if (!IsWindow(win.hwnd)) continue;
+                if (!IsWindowVisible(win.hwnd)) {
+                    alive.push_back(win);
+                    continue;
+                }
+                RECT r; GetWindowRect(win.hwnd, &r);
+                float barHeight = 30.0f;
+                float btnSize = 14.0f;
+                float btnGap = 8.0f;
+                float btnPad = 10.0f;
+                ImVec2 barMin = ImVec2((float)r.left, (float)r.top);
+                ImVec2 barMax = ImVec2((float)r.right, (float)r.top + barHeight);
+
+                chromeDraw->AddRectFilled(barMin, barMax, IM_COL32(250, 250, 252, 235), 6.0f);
+                chromeDraw->AddRect(barMin, barMax, IM_COL32(255, 255, 255, 120), 6.0f);
+
+                float ctrlWidth = btnSize * 3.0f + btnGap * 2.0f;
+                float dragWidth = (barMax.x - barMin.x) - (ctrlWidth + btnPad * 2.0f);
+                if (dragWidth < 20.0f) dragWidth = 20.0f;
+
+                ImGui::PushID(win.hwnd);
+                ImGui::SetCursorScreenPos(barMin);
+                ImGui::InvisibleButton("WinDrag", ImVec2(dragWidth, barHeight));
+                if (ImGui::IsItemActivated()) {
+                    dragHwnd = win.hwnd;
+                    dragOffset = ImVec2(ImGui::GetIO().MousePos.x - barMin.x, ImGui::GetIO().MousePos.y - barMin.y);
+                }
+                if (dragHwnd == win.hwnd && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    int nx = (int)(ImGui::GetIO().MousePos.x - dragOffset.x);
+                    int ny = (int)(ImGui::GetIO().MousePos.y - dragOffset.y);
+                    SetWindowPos(win.hwnd, HWND_TOP, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                }
+                if (dragHwnd == win.hwnd && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    dragHwnd = nullptr;
+                }
+
+                float btnY = barMin.y + (barHeight - btnSize) * 0.5f;
+                float x = barMax.x - btnPad - btnSize;
+
+                ImGui::SetCursorScreenPos(ImVec2(x, btnY));
+                ImGui::InvisibleButton("WinClose", ImVec2(btnSize, btnSize));
+                bool closeHover = ImGui::IsItemHovered();
+                ImU32 closeColor = closeHover ? IM_COL32(255, 95, 95, 230) : IM_COL32(255, 120, 120, 210);
+                chromeDraw->AddCircleFilled(ImVec2(x + btnSize * 0.5f, btnY + btnSize * 0.5f), btnSize * 0.48f, closeColor);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    PostMessage(win.hwnd, WM_CLOSE, 0, 0);
+                }
+
+                x -= btnGap + btnSize;
+                ImGui::SetCursorScreenPos(ImVec2(x, btnY));
+                ImGui::InvisibleButton("WinMax", ImVec2(btnSize, btnSize));
+                bool maxHover = ImGui::IsItemHovered();
+                ImU32 maxColor = maxHover ? IM_COL32(255, 210, 90, 230) : IM_COL32(255, 225, 140, 210);
+                chromeDraw->AddRectFilled(ImVec2(x + 2.0f, btnY + 2.0f), ImVec2(x + btnSize - 2.0f, btnY + btnSize - 2.0f), maxColor, 3.0f);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    if (IsZoomed(win.hwnd)) ShowWindow(win.hwnd, SW_RESTORE);
+                    else ShowWindow(win.hwnd, SW_MAXIMIZE);
+                }
+
+                x -= btnGap + btnSize;
+                ImGui::SetCursorScreenPos(ImVec2(x, btnY));
+                ImGui::InvisibleButton("WinMin", ImVec2(btnSize, btnSize));
+                bool minHover = ImGui::IsItemHovered();
+                ImU32 minColor = minHover ? IM_COL32(110, 220, 140, 230) : IM_COL32(140, 235, 165, 210);
+                chromeDraw->AddRectFilled(ImVec2(x + 3.0f, btnY + btnSize * 0.5f), ImVec2(x + btnSize - 3.0f, btnY + btnSize * 0.5f + 2.0f), minColor, 1.5f);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    ShowWindow(win.hwnd, SW_MINIMIZE);
+                }
+
+                ImGui::PopID();
+                alive.push_back(win);
+            }
+
+            g_hijackedWindows.swap(alive);
+            ImGui::End();
+            ImGui::PopStyleVar(3);
         }
 
         if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
@@ -1112,6 +1755,23 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
         DirectX::XMVECTOR rayOrigin = DirectX::XMLoadFloat3(&camera.Position);
         DirectX::XMVECTOR rayDir    = DirectX::XMLoadFloat3(&camera.GetForward());
+        if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
+            ImGuiViewport* viewport = ImGui::GetMainViewport();
+            ImVec2 mouse = ImGui::GetIO().MousePos;
+            if (width > 1.0f && height > 1.0f) {
+                float mx = (mouse.x - viewport->WorkPos.x) / width;
+                float my = (mouse.y - viewport->WorkPos.y) / height;
+                if (mx < 0.0f) mx = 0.0f; if (mx > 1.0f) mx = 1.0f;
+                if (my < 0.0f) my = 0.0f; if (my > 1.0f) my = 1.0f;
+                mx = mx * 2.0f - 1.0f;
+                my = 1.0f - my * 2.0f;
+                DirectX::XMVECTOR nearClip = DirectX::XMVectorSet(mx, my, 0.0f, 1.0f);
+                DirectX::XMVECTOR farClip = DirectX::XMVectorSet(mx, my, 1.0f, 1.0f);
+                DirectX::XMVECTOR nearWorld = DirectX::XMVector3TransformCoord(nearClip, invViewProj);
+                DirectX::XMVECTOR farWorld = DirectX::XMVector3TransformCoord(farClip, invViewProj);
+                rayDir = DirectX::XMVector3Normalize(DirectX::XMVectorSubtract(farWorld, rayOrigin));
+            }
+        }
         
         int hitAppIndex = -1;
         float minDistance = 9999.0f;
@@ -1132,10 +1792,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi;
                     if (CreateProcessW(NULL, cmdBuffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
                         HWND currentFocus = GetForegroundWindow();
-                        g_pendingHijacks.push_back({ currentFocus, 0 });
+                        g_pendingHijacks.push_back({ currentFocus, 0, pi.dwProcessId });
                         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
                         g_currentState = STATE_2D_WORKBENCH;
                         while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
+                        SetSystemTaskbarVisible(false);
                     }
                     g_lastClickTime = 0;
                 } else {
@@ -1149,27 +1810,31 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     }
                     g_myApps[hitAppIndex].IsSelected = true;
 
-                    g_grabbedAppIndex = hitAppIndex;
-                    g_mouseDownTime = GetTickCount();
+                    if (!g_uiUnlocked) {
+                        g_grabbedAppIndex = hitAppIndex;
+                        g_mouseDownTime = GetTickCount();
+                    }
                 }
             } else {
                 for (auto& a : g_myApps) {
                     if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) a.IsSelected = false;
                     a.WasSelected = a.IsSelected;
                 }
-                g_isBlankDragging = true;
-                
-                DirectX::XMFLOAT2 startAngle = GetYawPitch(rayDir);
-                g_dragStartYaw = startAngle.x;
-                g_dragStartPitch = startAngle.y;
-                g_dragCurrYaw = g_dragStartYaw;
-                g_dragCurrPitch = g_dragStartPitch;
-                g_dragPrevRawYaw = startAngle.x;
+                if (!g_uiUnlocked) {
+                    g_isBlankDragging = true;
+                    
+                    DirectX::XMFLOAT2 startAngle = GetYawPitch(rayDir);
+                    g_dragStartYaw = startAngle.x;
+                    g_dragStartPitch = startAngle.y;
+                    g_dragCurrYaw = g_dragStartYaw;
+                    g_dragCurrPitch = g_dragStartPitch;
+                    g_dragPrevRawYaw = startAngle.x;
+                }
             }
             g_leftClicked = false; 
         }
 
-        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
+        if (!g_uiUnlocked && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             if (g_grabbedAppIndex != -1) {
                 if (GetTickCount() - g_mouseDownTime > 150) {
                     g_isDragging = true;
@@ -1227,10 +1892,24 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
         ImDrawList* bg_draw_list = ImGui::GetBackgroundDrawList();
         
+        bool is2DMode = (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked);
         for (auto& app : g_myApps) {
-            int hoverState = app.IsSelected ? (app.IsHovered ? 3 : 2) : (app.IsHovered ? 1 : 0);
+            int hoverState = 0;
+            if (is2DMode) {
+                hoverState = app.IsHovered ? 1 : 0;
+            } else {
+                hoverState = app.IsSelected ? (app.IsHovered ? 3 : 2) : (app.IsHovered ? 1 : 0);
+            }
             DirectX::XMFLOAT3 appScale = {1.2f, 1.2f, 0.6f}; 
-            cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, app.Position, appScale, app.BaseColor, app.IconTexture, camera.Position, hoverState, viewMatrix);
+            float spinAngle = 0.0f;
+            float orbitAngle = 0.0f;
+            float tiltAngle = 0.0f;
+            if (is2DMode && app.IsSelected) {
+                spinAngle = appSpinTime * 2.6f;
+                orbitAngle = appSpinTime * 0.8f;
+                tiltAngle = 0.55f;
+            }
+            cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, app.Position, appScale, app.BaseColor, app.IconTexture, camera.Position, hoverState, viewMatrix, 8.0f, spinAngle, orbitAngle, tiltAngle);
             
             // 🚨 3D 全息投影到 2D 屏幕文字
             DirectX::XMVECTOR appPos = DirectX::XMLoadFloat3(&app.Position);
@@ -1320,6 +1999,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (comUninit) {
         CoUninitialize();
     }
+    if (g_tabHotkeyRegistered) {
+        UnregisterHotKey(hwnd, 1);
+    }
+    SetSystemTaskbarVisible(true);
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;
