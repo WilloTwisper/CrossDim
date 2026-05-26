@@ -16,7 +16,7 @@ public:
         HICON hIcon = CopyIcon(iconHandle);
         if (!hIcon) return nullptr;
 
-        int texSize = 256;
+        int texSize = 512;
         HDC hdcScreen = GetDC(NULL);
         HDC hdcMem = CreateCompatibleDC(hdcScreen);
 
@@ -68,7 +68,7 @@ public:
     static ID3D11ShaderResourceView* LoadIconFromExe(ID3D11Device* device, LPCWSTR exePath) {
         HICON hIcon = NULL;
         bool destroyIcon = true;
-        PrivateExtractIconsW(exePath, 0, 256, 256, &hIcon, NULL, 1, LR_LOADFROMFILE);
+        PrivateExtractIconsW(exePath, 0, 512, 512, &hIcon, NULL, 1, LR_LOADFROMFILE);
         if (!hIcon) {
             ExtractIconExW(exePath, 0, &hIcon, NULL, 1);
             if (!hIcon) {
@@ -88,7 +88,7 @@ public:
             if (!hIcon) return nullptr;
         }
 
-        int texSize = 256;
+        int texSize = 512;
         HDC hdcScreen = GetDC(NULL);
         HDC hdcMem = CreateCompatibleDC(hdcScreen);
 
@@ -167,19 +167,45 @@ public:
         converter->CopyPixels(nullptr, width * 4, (UINT)pixels.size(), pixels.data());
 
         D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.Width = width; desc.Height = height; desc.MipLevels = 0; desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
-        D3D11_SUBRESOURCE_DATA init = {}; init.pSysMem = pixels.data(); init.SysMemPitch = width * 4;
         ID3D11Texture2D* tex = nullptr;
-        HRESULT hr = device->CreateTexture2D(&desc, &init, &tex);
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &tex);
+
+        if (SUCCEEDED(hr) && tex) {
+            ID3D11DeviceContext* ctx = nullptr;
+            device->GetImmediateContext(&ctx);
+            if (ctx) {
+                ctx->UpdateSubresource(tex, 0, nullptr, pixels.data(), width * 4, 0);
+                ctx->Release();
+            }
+        }
 
         converter->Release(); frame->Release(); decoder->Release(); factory->Release();
 
         if (FAILED(hr) || !tex) return nullptr;
 
         ID3D11ShaderResourceView* srv = nullptr;
-        device->CreateShaderResourceView(tex, nullptr, &srv);
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = desc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = (UINT)-1;
+        device->CreateShaderResourceView(tex, &srvDesc, &srv);
+
+        {
+            ID3D11DeviceContext* ctx = nullptr;
+            device->GetImmediateContext(&ctx);
+            if (ctx) {
+                ctx->GenerateMips(srv);
+                ctx->Release();
+            }
+        }
+
         tex->Release();
         return srv;
     }

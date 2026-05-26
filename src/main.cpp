@@ -21,6 +21,7 @@
 #include <endpointvolume.h>
 #include <imm.h>
 #include <iphlpapi.h>
+#include <shlobj.h>
 
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
@@ -34,12 +35,14 @@
 #include "Engine/CubeRenderer.h"
 #include "Engine/TextureLoader.h"
 #include "Engine/ModelRenderer.h"
+#include "Engine/Logger.h"
 enum CrossDimState {
     STATE_3D_EXPLORE,
     STATE_2D_WORKBENCH
 };
 CrossDimState g_currentState = STATE_3D_EXPLORE;
 bool g_uiUnlocked = false;
+bool g_previousUiUnlocked = false;
 
 #pragma comment(linker, "/subsystem:windows")
 #pragma comment(lib, "d3d11.lib")
@@ -48,6 +51,7 @@ bool g_uiUnlocked = false;
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 ID3D11Device*           g_pd3dDevice = nullptr;
 ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
@@ -70,7 +74,8 @@ int   g_lastClickedApp = -1;
 
 int   g_grabbedAppIndex = -1;  
 bool  g_isDragging = false;    
-DWORD g_mouseDownTime = 0;     
+DWORD g_mouseDownTime = 0;
+int   g_dropTargetIndex = -1;     
 
 bool  g_isBlankDragging = false;
 float g_dragStartYaw = 0.0f;
@@ -78,6 +83,8 @@ float g_dragStartPitch = 0.0f;
 float g_dragCurrYaw = 0.0f;
 float g_dragCurrPitch = 0.0f;
 float g_dragPrevRawYaw = 0.0f;
+
+float g_fpsCurrent = 0.0f;
 
 struct PendingHijack {
     HWND originalFocus;
@@ -413,7 +420,7 @@ static ID3D11ShaderResourceView* GetWindowIconTexture(ID3D11Device* device, HWND
 struct AppCube {
     DirectX::XMFLOAT3 Position; 
     DirectX::XMFLOAT4 BaseColor;
-    LPCWSTR AppPath; 
+    std::wstring AppPath; 
     std::string AppName;
     bool IsHovered;
     bool IsSelected; 
@@ -444,22 +451,133 @@ float g_modelRotateAccumDecay = 10.0f;
 bool g_modelLockScreenPos = true;
 bool g_pivotAutoSet = false;
 
-std::vector<AppCube> g_myApps = {
-    { {-5.14f, 3.0f, 6.12f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Windows\\System32\\control.exe", "控制面板", false, false, false, nullptr },
-    { {-2.73f, 3.0f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Windows\\System32\\taskmgr.exe", "任务管理器", false, false, false, nullptr },
-    { { 0.00f, 3.0f, 8.00f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Windows\\explorer.exe",         "文件管理器", false, false, false, nullptr },
-    { { 2.73f, 3.0f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Windows\\System32\\cmd.exe",     "命令提示符", false, false, false, nullptr },
-    { { 5.14f, 3.0f, 6.12f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\Clash Verge\\clash-verge.exe", "Clash", false, false, false, nullptr },
-    { {-5.14f, 0.5f, 6.12f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "Edge 浏览器", false, false, false, nullptr },
-    { {-2.73f, 0.5f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",        "Chrome 浏览器", false, false, false, nullptr },
-    { { 0.00f, 0.5f, 8.00f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\Microsoft VS Code\\Code.exe",  "VS Code", false, false, false, nullptr },
-    { { 2.73f, 0.5f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\洛克王国：世界(2002304)\\洛克王国：世界.exe",    "洛克王国", false, false, false, nullptr },
-    { { 5.14f, 0.5f, 6.12f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\Weixin\\Weixin.exe", "微信", false, false, false, nullptr },
-    { {-2.73f, -2.0f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\BaiduNetdisk\\BaiduNetdisk.exe", "百度网盘", false, false, false, nullptr },
-    { { 0.00f, -2.0f, 8.00f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\QQ\\QQ.exe", "QQ", false, false, false, nullptr },
-    { { 2.73f, -2.0f, 7.51f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\Steam\\Steam.exe", "Steam", false, false, false, nullptr },
-    { { 5.14f, -2.0f, 6.12f}, {0.3f, 0.3f, 0.3f, 1.0f}, L"D:\\Apps\\Chrome\\Application\\chrome.exe", "Chrome", false, false, false, nullptr }
-};
+static std::wstring ResolveShortcutTarget(LPCWSTR lnkPath) {
+    std::wstring target;
+    IShellLinkW* shellLink = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink)))) return target;
+    IPersistFile* persistFile = nullptr;
+    if (SUCCEEDED(shellLink->QueryInterface(IID_PPV_ARGS(&persistFile)))) {
+        if (SUCCEEDED(persistFile->Load(lnkPath, STGM_READ))) {
+            shellLink->Resolve(nullptr, SLR_NO_UI | SLR_UPDATE);
+            WCHAR buf[MAX_PATH];
+            if (SUCCEEDED(shellLink->GetPath(buf, MAX_PATH, nullptr, SLGP_RAWPATH))) target = buf;
+        }
+        persistFile->Release();
+    }
+    shellLink->Release();
+    return target;
+}
+
+static std::string WcsToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string result(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], len, nullptr, nullptr);
+    return result;
+}
+
+static void LaunchAppByPath(LPCWSTR appPath) {
+    if (!appPath || appPath[0] == L'\0') return;
+    size_t len = wcslen(appPath);
+    bool isExe = (len > 4 && _wcsicmp(appPath + len - 4, L".exe") == 0);
+    if (isExe) {
+        WCHAR cmdBuffer[MAX_PATH]; wcscpy_s(cmdBuffer, appPath);
+        STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi;
+        if (CreateProcessW(NULL, cmdBuffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            HWND currentFocus = GetForegroundWindow();
+            g_pendingHijacks.push_back({ currentFocus, 0, pi.dwProcessId });
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            g_previousUiUnlocked = g_uiUnlocked;
+            g_currentState = STATE_2D_WORKBENCH;
+            while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
+            SetSystemTaskbarVisible(false);
+        }
+    } else {
+        HINSTANCE result = ShellExecuteW(NULL, L"open", appPath, NULL, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)result <= 32) {
+            LOGW(L"[desk] ShellExecute failed (%d) for: %s", (int)(INT_PTR)result, appPath);
+        }
+    }
+}
+
+static void ScanDesktopForApps(std::vector<AppCube>& outApps) {
+    WCHAR desktopPaths[2][MAX_PATH];
+    int pathCount = 0;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktopPaths[pathCount]))) pathCount++;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_DESKTOPDIRECTORY, nullptr, 0, desktopPaths[pathCount]))) pathCount++;
+    std::vector<std::wstring> allNames;
+    std::vector<std::pair<std::wstring, std::string>> entries;
+    for (int pi = 0; pi < pathCount; pi++) {
+        std::wstring searchPath = std::wstring(desktopPaths[pi]) + L"\\*.*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) { LOGW(L"[desk] FF failed: %s", desktopPaths[pi]); continue; }
+        int found = 0;
+        do {
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            std::wstring fname(fd.cFileName);
+            std::wstring fullPath = std::wstring(desktopPaths[pi]) + L"\\" + fname;
+            size_t dot = fname.rfind(L'.');
+            std::wstring ext = (dot != std::wstring::npos) ? fname.substr(dot) : L"";
+            std::wstring nameOnly = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
+            std::wstring targetPath;
+            std::string displayName = WcsToUtf8(nameOnly);
+            bool include = false;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (fname == L"." || fname == L"..") continue;
+                targetPath = fullPath; include = true;
+            } else if (_wcsicmp(ext.c_str(), L".lnk") == 0) {
+                targetPath = ResolveShortcutTarget(fullPath.c_str());
+                if (targetPath.empty()) continue;
+                IShellLinkW* sl = nullptr;
+                if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) {
+                    IPersistFile* pf = nullptr;
+                    if (SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf)))) {
+                        if (SUCCEEDED(pf->Load(fullPath.c_str(), STGM_READ))) {
+                            WCHAR desc[256];
+                            if (SUCCEEDED(sl->GetDescription(desc, 256)) && desc[0]) displayName = WcsToUtf8(desc);
+                        }
+                        pf->Release();
+                    }
+                    sl->Release();
+                }
+                include = true;
+            } else if (_wcsicmp(ext.c_str(), L".exe") == 0) {
+                targetPath = fullPath; include = true;
+            } else if (!ext.empty() && _wcsicmp(ext.c_str(), L".ini") != 0 && _wcsicmp(ext.c_str(), L".log") != 0 && _wcsicmp(ext.c_str(), L".tmp") != 0) {
+                targetPath = fullPath; include = true;
+            }
+            if (include) { entries.push_back({ targetPath, displayName }); found++; }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+        LOG("[desk] %ls: %d entries", desktopPaths[pi], found);
+    }
+    const int count = (int)entries.size();
+    if (count == 0) return;
+    const int rows = (count <= 5) ? 1 : (count <= 12) ? 2 : (count <= 24) ? 3 : 4;
+    const float xSpan = 12.0f, yStart = 4.5f, yStep = 3.0f, zBase = 8.0f;
+    int idx = 0;
+    for (int r = 0; r < rows && idx < count; ++r) {
+        int perRow = (count + rows - 1) / rows;
+        int start = r * perRow, end = (r + 1) * perRow;
+        if (end > count) end = count;
+        int n = end - start;
+        for (int c = 0; c < n; ++c) {
+            float x = (n <= 1) ? 0.0f : (-xSpan * 0.5f + xSpan * c / (float)(n - 1));
+            float y = yStart - r * yStep;
+            AppCube cube = {};
+            cube.Position = DirectX::XMFLOAT3(x, y, zBase);
+            cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
+            cube.AppPath = entries[idx].first;
+            cube.AppName = entries[idx].second;
+            outApps.push_back(cube);
+            idx++;
+        }
+    }
+}
+
+std::vector<AppCube> g_myApps;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -582,6 +700,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+            for (UINT i = 0; i < fileCount; ++i) {
+                WCHAR filePath[MAX_PATH];
+                DragQueryFileW(hDrop, i, filePath, MAX_PATH);
+                std::wstring fpath(filePath);
+                std::wstring fname = fpath;
+                size_t slash = fname.rfind(L'\\');
+                if (slash != std::wstring::npos) fname = fname.substr(slash + 1);
+                size_t dot = fname.rfind(L'.');
+                std::wstring nameOnly = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
+                std::string label;
+                for (wchar_t ch : nameOnly) label += (char)ch;
+
+                AppCube cube = {};
+                cube.Position = DirectX::XMFLOAT3(0.0f, 1.5f, 8.0f);
+                cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
+                cube.AppPath = fpath;
+                cube.AppName = label;
+                cube.IconTexture = TextureLoader::LoadIconFromExe(g_pd3dDevice, fpath.c_str());
+                if (!cube.IconTexture) {
+                    SHFILEINFOW sfi = {};
+                    if (SHGetFileInfoW(fpath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
+                        if (sfi.hIcon) { cube.IconTexture = TextureLoader::LoadIconFromHandle(g_pd3dDevice, sfi.hIcon); DestroyIcon(sfi.hIcon); }
+                    }
+                }
+                g_myApps.push_back(cube);
+                LOGW(L"[drop] Added: %s", fpath.c_str());
+            }
+            DragFinish(hDrop);
+            break;
+        }
         case WM_LBUTTONDOWN: {
             if (g_currentState == STATE_3D_EXPLORE) {
                 g_leftClicked = true;
@@ -654,6 +805,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     g_mainHwnd = hwnd;
     g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
     SetSystemTaskbarVisible(false);
+    DragAcceptFiles(hwnd, TRUE);
     RAWINPUTDEVICE rid[1];
     rid[0].usUsagePage = 0x01;
     rid[0].usUsage = 0x02;
@@ -695,8 +847,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
     modelRenderer.LoadModelAsync("assets/bloom_high/bloom_high.obj");
     
+    ScanDesktopForApps(g_myApps);
     for (auto& app : g_myApps) {
-        app.IconTexture = TextureLoader::LoadIconFromExe(g_pd3dDevice, app.AppPath);
+        app.IconTexture = TextureLoader::LoadIconFromExe(g_pd3dDevice, app.AppPath.c_str());
+        if (!app.IconTexture) {
+            SHFILEINFOW sfi = {};
+            if (SHGetFileInfoW(app.AppPath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
+                if (sfi.hIcon) { app.IconTexture = TextureLoader::LoadIconFromHandle(g_pd3dDevice, sfi.hIcon); DestroyIcon(sfi.hIcon); }
+            }
+        }
+        if (!app.IconTexture) LOGW(L"[desk] No icon: %s", app.AppPath.c_str());
     }
 
 
@@ -714,6 +874,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (dt < 0.0f) dt = 0.0f;
         if (dt > 0.1f) dt = 0.1f;
         lastTick = nowTick;
+        { float ifps = (dt > 0.0001f) ? (1.0f / dt) : 0.0f; g_fpsCurrent += (ifps - g_fpsCurrent) * 0.02f; }
         static float appSpinTime = 0.0f;
         appSpinTime += dt;
 
@@ -788,10 +949,20 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
                     it = g_pendingHijacks.erase(it);
                     continue;
+                } else {
+                    LOGW(L"[hijack] window found but no WS_CAPTION (modern app?), go back to 3D: HWND=0x%p", target);
+                    it = g_pendingHijacks.erase(it);
+                    if (g_pendingHijacks.empty() && g_hijackedWindows.empty()) {
+                        g_currentState = STATE_3D_EXPLORE;
+                        g_uiUnlocked = true;
+                        while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
+                    }
+                    continue;
                 }
             }
             
-            if (it->frameWait > 600) { 
+            if (it->frameWait > 120) { 
+                LOGW(L"[hijack] pending hijack PID=%u timed out (120 frames)", it->processId);
                 it = g_pendingHijacks.erase(it);
             } else {
                 ++it;
@@ -1505,7 +1676,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
 
-        if (g_uiUnlocked && !g_hijackedWindows.empty()) {
+        if ((g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) && !g_hijackedWindows.empty()) {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
             ImGui::SetNextWindowPos(viewport->WorkPos);
             ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -1569,7 +1740,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImU32 closeColor = closeHover ? IM_COL32(255, 95, 95, 230) : IM_COL32(255, 120, 120, 210);
                 chromeDraw->AddCircleFilled(ImVec2(x + btnSize * 0.5f, btnY + btnSize * 0.5f), btnSize * 0.48f, closeColor);
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    ShowWindow(win.hwnd, SW_HIDE);
                     PostMessage(win.hwnd, WM_CLOSE, 0, 0);
+                    continue;
                 }
 
                 x -= btnGap + btnSize;
@@ -1600,6 +1773,35 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             g_hijackedWindows.swap(alive);
             ImGui::End();
             ImGui::PopStyleVar(3);
+        }
+
+        // Clean up dead hijacked windows every frame
+        {
+            std::vector<HijackedWindow> live;
+            for (const auto& w : g_hijackedWindows) {
+                if (IsWindow(w.hwnd)) live.push_back(w);
+            }
+            if (live.size() != g_hijackedWindows.size()) {
+                g_hijackedWindows.swap(live);
+            }
+        }
+
+        // Auto-return: when all windows gone, restore original 3D state
+        if (g_currentState == STATE_2D_WORKBENCH && g_hijackedWindows.empty() && g_pendingHijacks.empty()) {
+            g_currentState = STATE_3D_EXPLORE;
+            g_uiUnlocked = g_previousUiUnlocked;
+            if (g_uiUnlocked) {
+                while (ShowCursor(TRUE) < 0);
+                ClipCursor(NULL);
+            } else {
+                while (ShowCursor(FALSE) >= 0);
+                RECT rect;
+                GetClientRect(hwnd, &rect);
+                MapWindowPoints(hwnd, nullptr, (POINT*)&rect, 2);
+                ClipCursor(&rect);
+                SetCursorPos(rect.left + (rect.right - rect.left) / 2,
+                             rect.top + (rect.bottom - rect.top) / 2);
+            }
         }
 
         if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
@@ -1788,16 +1990,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (g_leftClicked) {
             if (hitAppIndex != -1) {
                 if (GetTickCount() - g_lastClickTime < 400 && g_lastClickedApp == hitAppIndex) {
-                    WCHAR cmdBuffer[MAX_PATH]; wcscpy_s(cmdBuffer, g_myApps[hitAppIndex].AppPath);
-                    STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi;
-                    if (CreateProcessW(NULL, cmdBuffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                        HWND currentFocus = GetForegroundWindow();
-                        g_pendingHijacks.push_back({ currentFocus, 0, pi.dwProcessId });
-                        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                        g_currentState = STATE_2D_WORKBENCH;
-                        while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
-                        SetSystemTaskbarVisible(false);
-                    }
+                    g_previousUiUnlocked = g_uiUnlocked;
+                    LaunchAppByPath(g_myApps[hitAppIndex].AppPath.c_str());
                     g_lastClickTime = 0;
                 } else {
                     g_lastClickTime = GetTickCount();
@@ -1810,7 +2004,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     }
                     g_myApps[hitAppIndex].IsSelected = true;
 
-                    if (!g_uiUnlocked) {
+                    if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                         g_grabbedAppIndex = hitAppIndex;
                         g_mouseDownTime = GetTickCount();
                     }
@@ -1820,7 +2014,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) a.IsSelected = false;
                     a.WasSelected = a.IsSelected;
                 }
-                if (!g_uiUnlocked) {
+                if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                     g_isBlankDragging = true;
                     
                     DirectX::XMFLOAT2 startAngle = GetYawPitch(rayDir);
@@ -1834,7 +2028,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             g_leftClicked = false; 
         }
 
-        if (!g_uiUnlocked && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
             if (g_grabbedAppIndex != -1) {
                 if (GetTickCount() - g_mouseDownTime > 150) {
                     g_isDragging = true;
@@ -1847,13 +2041,57 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                         targetPos.y - g_myApps[g_grabbedAppIndex].Position.y,
                         targetPos.z - g_myApps[g_grabbedAppIndex].Position.z 
                     };
-                    
-                    for (auto& a : g_myApps) {
-                        if (a.IsSelected) {
-                            a.Position.x += delta.x;
-                            a.Position.y += delta.y;
-                            a.Position.z += delta.z;
+
+                    constexpr float COL_RADIUS = 0.80f;
+                    constexpr float COL_DIAM = COL_RADIUS * 2.0f;
+                    constexpr float REPEL_DIST = 2.0f;
+                    constexpr float REPEL_FORCE = 0.12f;
+
+                    for (int i = 0; i < (int)g_myApps.size(); ++i) {
+                        if (!g_myApps[i].IsSelected) continue;
+
+                        DirectX::XMFLOAT3 proposed = {
+                            g_myApps[i].Position.x + delta.x,
+                            g_myApps[i].Position.y + delta.y,
+                            g_myApps[i].Position.z + delta.z
+                        };
+
+                        for (int j = 0; j < (int)g_myApps.size(); ++j) {
+                            if (g_myApps[j].IsSelected) continue;
+
+                            float dx = proposed.x - g_myApps[j].Position.x;
+                            float dy = proposed.y - g_myApps[j].Position.y;
+                            float dz = proposed.z - g_myApps[j].Position.z;
+                            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+                            if (dist < COL_DIAM && dist > 0.001f) {
+                                float push = COL_DIAM - dist;
+                                proposed.x += (dx / dist) * push;
+                                proposed.y += (dy / dist) * push;
+                                proposed.z += (dz / dist) * push;
+                            }
+
+                            if (dist < REPEL_DIST && dist > 0.001f) {
+                                float force = (REPEL_DIST - dist) / REPEL_DIST * REPEL_FORCE;
+                                g_myApps[j].Position.x -= (dx / dist) * force;
+                                g_myApps[j].Position.y -= (dy / dist) * force;
+                                g_myApps[j].Position.z -= (dz / dist) * force;
+                            }
                         }
+
+                        g_myApps[i].Position = proposed;
+                    }
+
+                    // Drop-target detection: find closest non-selected cube to the dragged cube
+                    g_dropTargetIndex = -1;
+                    float bestDist = 1.5f;
+                    for (int k = 0; k < (int)g_myApps.size(); ++k) {
+                        if (g_myApps[k].IsSelected) continue;
+                        float dx = g_myApps[g_grabbedAppIndex].Position.x - g_myApps[k].Position.x;
+                        float dy = g_myApps[g_grabbedAppIndex].Position.y - g_myApps[k].Position.y;
+                        float dz = g_myApps[g_grabbedAppIndex].Position.z - g_myApps[k].Position.z;
+                        float d = sqrtf(dx*dx + dy*dy + dz*dz);
+                        if (d < bestDist) { bestDist = d; g_dropTargetIndex = k; }
                     }
                 }
             } else if (g_isBlankDragging) {
@@ -1887,15 +2125,35 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 }
             }
         } else {
+            // Drop-target: if dragging a file over an executable, open with
+            if (g_isDragging && g_dropTargetIndex >= 0 && g_dropTargetIndex < (int)g_myApps.size() &&
+                g_grabbedAppIndex >= 0 && g_grabbedAppIndex < (int)g_myApps.size()) {
+                const auto& target = g_myApps[g_dropTargetIndex];
+                const auto& source = g_myApps[g_grabbedAppIndex];
+                size_t tlen = target.AppPath.size();
+                bool targetIsExe = (tlen > 4 && _wcsicmp(target.AppPath.c_str() + tlen - 4, L".exe") == 0);
+                if (targetIsExe && !source.AppPath.empty()) {
+                    HINSTANCE res = ShellExecuteW(NULL, L"open", target.AppPath.c_str(),
+                                                   source.AppPath.c_str(), NULL, SW_SHOWNORMAL);
+                    if ((INT_PTR)res > 32) {
+                        LOGW(L"[drop] Open with: %s -> %s", source.AppPath.c_str(), target.AppPath.c_str());
+                    }
+                }
+                g_dropTargetIndex = -1;
+            }
             g_grabbedAppIndex = -1; g_isDragging = false; g_isBlankDragging = false;
+            g_dropTargetIndex = -1;
         }
 
         ImDrawList* bg_draw_list = ImGui::GetBackgroundDrawList();
         
         bool is2DMode = (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked);
-        for (auto& app : g_myApps) {
+        for (int appIdx = 0; appIdx < (int)g_myApps.size(); ++appIdx) {
+            auto& app = g_myApps[appIdx];
             int hoverState = 0;
-            if (is2DMode) {
+            if (g_isDragging && appIdx == g_dropTargetIndex) {
+                hoverState = 3; // full highlight for drop target
+            } else if (is2DMode) {
                 hoverState = app.IsHovered ? 1 : 0;
             } else {
                 hoverState = app.IsSelected ? (app.IsHovered ? 3 : 2) : (app.IsHovered ? 1 : 0);
@@ -1932,6 +2190,18 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 // 画黑色阴影 + 本体字
                 bg_draw_list->AddText(ImVec2(textPos.x + 2, textPos.y + 2), IM_COL32(0, 0, 0, 200), app.AppName.c_str());
                 bg_draw_list->AddText(textPos, textColor, app.AppName.c_str());
+
+                // Drop-target indicator: "Open with <source>"
+                if (g_isDragging && appIdx == g_dropTargetIndex && g_grabbedAppIndex >= 0 && g_grabbedAppIndex < (int)g_myApps.size()) {
+                    char openWithText[256];
+                    sprintf_s(openWithText, "Open with %s", g_myApps[g_grabbedAppIndex].AppName.c_str());
+                    ImVec2 owSize = ImGui::CalcTextSize(openWithText);
+                    float owX = screenX - owSize.x * 0.5f;
+                    float owY = screenY - textSize.y - owSize.y - 4.0f;
+                    bg_draw_list->AddRectFilled(ImVec2(owX - 4, owY - 2), ImVec2(owX + owSize.x + 4, owY + owSize.y + 2), IM_COL32(0, 0, 0, 160), 4.0f);
+                    bg_draw_list->AddText(ImVec2(owX + 1, owY + 1), IM_COL32(0, 0, 0, 200), openWithText);
+                    bg_draw_list->AddText(ImVec2(owX, owY), IM_COL32(0, 220, 255, 255), openWithText);
+                }
             }
         }
 
