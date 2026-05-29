@@ -1,21 +1,21 @@
 {
     "version": "2.0.0",
-    "tasks":[
+    "tasks": [
         {
             "label": "Build CrossDim",
             "type": "shell",
             "command": "cl.exe",
-            "args":[
+            "args": [
                 "/utf-8",
-                "/O2",  
+                "/O2",
                 "/Zi",
                 "/EHsc",
                 "/nologo",
                 "/I", "${workspaceFolder}\\vendor\\imgui",
                 "/I", "${workspaceFolder}\\src",
                 "${workspaceFolder}\\src\\main.cpp",
-                "${workspaceFolder}\\src\\Engine\\Camera.cpp", 
-                "${workspaceFolder}\\src\\Engine\\SkyboxRenderer.cpp", 
+                "${workspaceFolder}\\src\\Engine\\Camera.cpp",
+                "${workspaceFolder}\\src\\Engine\\SkyboxRenderer.cpp",
                 "${workspaceFolder}\\src\\Engine\\CubeRenderer.cpp",
                 "${workspaceFolder}\\src\\Engine\\ObjLoader.cpp",
                 "${workspaceFolder}\\src\\Engine\\ModelRenderer.cpp",
@@ -34,8 +34,37 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": ["$msCompile"],
-            "group": { "kind": "build", "isDefault": true },
-            "detail": "编译 CrossDim 引擎"
+            "group": "build",
+            "detail": "Build CrossDim shell"
+        },
+        {
+            "label": "Build Watchdog",
+            "type": "shell",
+            "command": "cl.exe",
+            "args": [
+                "/O2",
+                "/EHsc",
+                "/nologo",
+                "${workspaceFolder}\\src\\watchdog.cpp",
+                "advapi32.lib",
+                "/Fe:${workspaceFolder}\\build\\watchdog.exe",
+                "/Fo:${workspaceFolder}\\build\\watchdog.obj"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$msCompile"],
+            "group": "build",
+            "detail": "Build watchdog process"
+        },
+        {
+            "label": "Build All",
+            "dependsOn": ["Build CrossDim", "Build Watchdog"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Build CrossDim + Watchdog"
         }
     ]
 }

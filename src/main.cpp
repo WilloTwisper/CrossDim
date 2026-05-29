@@ -36,6 +36,7 @@
 #include "Engine/TextureLoader.h"
 #include "Engine/ModelRenderer.h"
 #include "Engine/Logger.h"
+#include "Engine/TrayProxy.h"
 enum CrossDimState {
     STATE_3D_EXPLORE,
     STATE_2D_WORKBENCH
@@ -52,6 +53,7 @@ bool g_previousUiUnlocked = false;
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 ID3D11Device*           g_pd3dDevice = nullptr;
 ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
@@ -63,6 +65,8 @@ RECT g_taskbarRect = { 0, 0, 0, 0 };
 bool g_taskbarRectValid = false;
 bool g_systemTaskbarHidden = false;
 bool g_tabHotkeyRegistered = false;
+HANDLE g_hHeartbeatEvent = nullptr;
+HANDLE g_hShutdownEvent = nullptr;
 
 float g_mouseDeltaX = 0.0f;
 float g_mouseDeltaY = 0.0f;
@@ -638,6 +642,10 @@ void CleanupDevice() {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto toggleUiUnlock = [&](HWND hwnd) {
         g_uiUnlocked = !g_uiUnlocked;
+        LOG("Tab: toggle uiUnlocked -> %d (state=%s, hij=%zu, pend=%zu)",
+            g_uiUnlocked,
+            (g_currentState == STATE_2D_WORKBENCH) ? "2D" : "3D",
+            g_hijackedWindows.size(), g_pendingHijacks.size());
         if (g_uiUnlocked) {
             while (ShowCursor(TRUE) < 0);
             ClipCursor(NULL);
@@ -655,6 +663,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     if (msg == WM_HOTKEY && wParam == 1) {
         toggleUiUnlock(hWnd);
+        return 0;
+    }
+    if (msg == WM_HOTKEY && wParam == 2) {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        WCHAR cmd[] = L"taskmgr.exe";
+        CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+        if (pi.hProcess) CloseHandle(pi.hProcess);
+        if (pi.hThread) CloseHandle(pi.hThread);
         return 0;
     }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
@@ -804,6 +821,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                                 nullptr, nullptr, wc.hInstance, nullptr);
     g_mainHwnd = hwnd;
     g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
+    RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_ESCAPE);
     SetSystemTaskbarVisible(false);
     DragAcceptFiles(hwnd, TRUE);
     RAWINPUTDEVICE rid[1];
@@ -817,6 +835,24 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     }
 
     if (!InitDevice(hwnd)) { CleanupDevice(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
+
+    g_hHeartbeatEvent = CreateEventW(nullptr, FALSE, FALSE, L"Global\\CrossDim_Heartbeat");
+    g_hShutdownEvent = CreateEventW(nullptr, TRUE, FALSE, L"Global\\CrossDim_Shutdown");
+    {
+        STARTUPINFOW wdSi = { sizeof(wdSi) };
+        PROCESS_INFORMATION wdPi = {};
+        WCHAR wdPath[MAX_PATH];
+        GetModuleFileNameW(NULL, wdPath, MAX_PATH);
+        std::wstring wdDir(wdPath);
+        size_t wdPos = wdDir.rfind(L'\\');
+        if (wdPos != std::wstring::npos) wdDir = wdDir.substr(0, wdPos);
+        swprintf_s(wdPath, L"%s\\watchdog.exe", wdDir.c_str());
+        if (CreateProcessW(wdPath, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &wdSi, &wdPi)) {
+            CloseHandle(wdPi.hProcess);
+            CloseHandle(wdPi.hThread);
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow); UpdateWindow(hwnd);
     ShowCursor(FALSE);
 
@@ -874,6 +910,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (dt < 0.0f) dt = 0.0f;
         if (dt > 0.1f) dt = 0.1f;
         lastTick = nowTick;
+        if (g_hHeartbeatEvent) SetEvent(g_hHeartbeatEvent);
         { float ifps = (dt > 0.0001f) ? (1.0f / dt) : 0.0f; g_fpsCurrent += (ifps - g_fpsCurrent) * 0.02f; }
         static float appSpinTime = 0.0f;
         appSpinTime += dt;
@@ -1642,35 +1679,72 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
 
             if (taskbarTrayOpen) {
-                float panelWidth = 240.0f;
-                float panelHeight = 150.0f;
-                ImVec2 panelPos = ImVec2(
-                    p1.x - panelWidth - paddingX,
-                    barPos.y - panelHeight - 10.0f
-                );
+                static std::vector<TrayIconEntry> s_trayIcons;
+                static std::unordered_map<std::wstring, ID3D11ShaderResourceView*> s_trayIconCache;
+                static int s_trayQueryFrame = 999;
+                s_trayQueryFrame++;
+                if (s_trayQueryFrame >= 60) {
+                    s_trayQueryFrame = 0;
+                    s_trayIcons = QueryTrayIcons();
+                    std::vector<RunningWindow> rw = EnumerateRunningWindows(g_mainHwnd);
+                    for (auto& icon : s_trayIcons) {
+                        if (!icon.exePath.empty()) continue;
+                        for (const auto& w : rw) {
+                            if (!w.path.empty()) {
+                                size_t p = w.path.rfind(L'\\');
+                                std::wstring fname = (p != std::wstring::npos) ? w.path.substr(p + 1) : w.path;
+                                size_t d = fname.rfind(L'.');
+                                std::wstring nameOnly = (d != std::wstring::npos) ? fname.substr(0, d) : fname;
+                                if (!nameOnly.empty()
+                                    && icon.tooltip.find(nameOnly) != std::wstring::npos) {
+                                    icon.exePath = w.path;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                int iconCount = (int)s_trayIcons.size();
+                float rowHeight = 28.0f;
+                float panelW = 220.0f;
+                float panelH = 50.0f + iconCount * rowHeight;
+                if (panelH < 100.0f) panelH = 100.0f;
+                if (panelH > 400.0f) panelH = 400.0f;
+                ImVec2 panelPos = ImVec2(p1.x - panelW - paddingX, barPos.y - panelH - 10.0f);
                 ImGui::SetNextWindowPos(panelPos);
-                ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight));
+                ImGui::SetNextWindowSize(ImVec2(panelW, panelH));
                 ImGui::SetNextWindowBgAlpha(0.0f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
                 ImGui::Begin("CrossDim Tray", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
-
                 ImDrawList* panelDraw = ImGui::GetWindowDrawList();
                 ImVec2 q0 = ImGui::GetWindowPos();
-                ImVec2 q1 = ImVec2(q0.x + panelWidth, q0.y + panelHeight);
+                ImVec2 q1 = ImVec2(q0.x + panelW, q0.y + panelH);
                 panelDraw->AddRectFilled(q0, q1, IM_COL32(244, 246, 250, 235), 12.0f);
                 panelDraw->AddRect(q0, q1, IM_COL32(255, 255, 255, 120), 12.0f);
-
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.15f, 0.18f, 0.24f, 1.0f));
-                ImGui::Text("后台运行");
+                ImGui::Text(s_trayIcons.empty() ? "(no tray icons detected)" : "System Tray");
                 ImGui::Separator();
-                const char* hiddenItems[] = { "OneDrive", "NVIDIA", "Steam" };
-                for (int i = 0; i < (int)(sizeof(hiddenItems) / sizeof(hiddenItems[0])); ++i) {
-                    ImGui::BulletText("%s", hiddenItems[i]);
+                for (const auto& icon : s_trayIcons) {
+                    ID3D11ShaderResourceView* iconSrv = nullptr;
+                    if (!icon.exePath.empty()) {
+                        auto it = s_trayIconCache.find(icon.exePath);
+                        if (it != s_trayIconCache.end()) iconSrv = it->second;
+                        else {
+                            iconSrv = GetTaskbarIcon(g_pd3dDevice, icon.exePath);
+                            s_trayIconCache[icon.exePath] = iconSrv;
+                        }
+                    }
+                    float imgSize = 22.0f;
+                    if (iconSrv) ImGui::Image((ImTextureID)iconSrv, ImVec2(imgSize, imgSize));
+                    else ImGui::Dummy(ImVec2(imgSize, imgSize));
+                    ImGui::SameLine();
+                    char label[128];
+                    WideCharToMultiByte(CP_UTF8, 0, icon.tooltip.c_str(), -1, label, sizeof(label), nullptr, nullptr);
+                    ImGui::Text("%s", label);
                 }
                 ImGui::PopStyleColor();
-
                 ImGui::End();
                 ImGui::PopStyleVar(3);
             }
@@ -1788,6 +1862,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
         // Auto-return: when all windows gone, restore original 3D state
         if (g_currentState == STATE_2D_WORKBENCH && g_hijackedWindows.empty() && g_pendingHijacks.empty()) {
+            LOG("[state] auto-return: 2D->3D, cursor unlocked");
             g_currentState = STATE_3D_EXPLORE;
             g_uiUnlocked = g_previousUiUnlocked;
             if (g_uiUnlocked) {
@@ -1801,6 +1876,41 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ClipCursor(&rect);
                 SetCursorPos(rect.left + (rect.right - rect.left) / 2,
                              rect.top + (rect.bottom - rect.top) / 2);
+            }
+        }
+
+        {
+            static int s_stuck2DFrames = 0;
+            static ULONGLONG s_lastStuckLog = 0;
+            if (g_currentState == STATE_2D_WORKBENCH) {
+                bool anyValid = false;
+                for (const auto& win : g_hijackedWindows) {
+                    if (IsWindow(win.hwnd)) { anyValid = true; break; }
+                }
+                if (!anyValid && g_hijackedWindows.empty()) {
+                    anyValid = !g_pendingHijacks.empty();
+                }
+                if (!anyValid) s_stuck2DFrames++;
+                else s_stuck2DFrames = 0;
+                if (s_stuck2DFrames > 600) {
+                    LOG("[force] stuck in 2D for %d frames, force-clear (hij=%zu, pend=%zu)",
+                        s_stuck2DFrames, g_hijackedWindows.size(), g_pendingHijacks.size());
+                    g_hijackedWindows.clear();
+                    g_pendingHijacks.clear();
+                    g_currentState = STATE_3D_EXPLORE;
+                    g_uiUnlocked = true;
+                    while (ShowCursor(TRUE) < 0);
+                    ClipCursor(NULL);
+                    s_stuck2DFrames = 0;
+                }
+                if (s_stuck2DFrames > 0 && s_stuck2DFrames % 300 == 0
+                    && nowTick - s_lastStuckLog > 5000) {
+                    LOG("[warn] possibly stuck 2D: frames=%d, hij=%zu, pend=%zu",
+                        s_stuck2DFrames, g_hijackedWindows.size(), g_pendingHijacks.size());
+                    s_lastStuckLog = nowTick;
+                }
+            } else {
+                s_stuck2DFrames = 0;
             }
         }
 
@@ -2272,6 +2382,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (g_tabHotkeyRegistered) {
         UnregisterHotKey(hwnd, 1);
     }
+    UnregisterHotKey(hwnd, 2);
+    if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
+    if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
     SetSystemTaskbarVisible(true);
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
