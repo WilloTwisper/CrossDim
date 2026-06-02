@@ -41,7 +41,7 @@
 ### Compiled source files (`tasks.json` explicit file list)
 | File | Lines | Notes |
 |---|---|---|
-| `src/main.cpp` | 2389 | Entry point. `wWinMain`, state machine, taskbar, window hijacking, raycasting, drag-drop |
+| `src/main.cpp` | 2474 | Entry point. `wWinMain`, state machine, taskbar, window hijacking, raycasting, drag-drop, search, spherical layout |
 | `src/Engine/Camera.cpp` | 69 | FPS-style camera (rotation only, `Move()` exists but never called) |
 | `src/Engine/SkyboxRenderer.cpp` | 147 | Procedural skybox |
 | `src/Engine/CubeRenderer.cpp` | 251 | 3D icon cubes + spherical sector selection |
@@ -52,8 +52,8 @@
 | `vendor/imgui/backends/imgui_impl_dx11.cpp` | — | DX11 backend |
 
 ### Source files NOT in the build
-- `src/Engine/BloomRenderer.cpp` (229 lines) + `.h` — fully implemented but **NOT in tasks.json**. `build/BloomRenderer.obj` exists from prior compilation.
 - `src/Engine/Logger.h` (77 lines) — header-only singleton, included by `main.cpp`.
+- `src/Engine/TrayProxy.h` (75 lines) — header-only tray icon query helper, included by `main.cpp`.
 - `src/Engine/TextureLoader.h` (212 lines) — header-only texture/icon utilities, included by `main.cpp`.
 
 No tests exist. No lint/formatter config at project root.
@@ -130,60 +130,60 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 4. **Tray icon proxy** (~300 lines) — hook into Explorer's tray toolbar to read icon state, render natively in CrossDim's taskbar.
 5. **Startup splash + degraded recovery** — splash window on init; if D3D init fails within 10s, auto-restore Shell registry and launch Explorer.
 
-## Known Issues (must fix before Phase 1 completion)
+## Known Issues (all resolved in v0.0.6)
 
-| # | Issue | Location | Severity | Fix Estimate |
-|---|---|---|---|---|
-| 1 | `g_leftClicked` reset twice per frame (line 2136 + line 2367), redundant | `main.cpp` | Low | 1 line |
-| 2 | `g_taskbarWindowIconCache` never prunes entries for dead HWNDs → D3D SRV leak over long sessions | `main.cpp:111, 403-427` | Medium | ~20 lines |
-| 3 | 2D mode diagnostic spam (`main.cpp:817-833`) — indicates 2D→3D auto-return can get stuck | `main.cpp:817-833` | High | ~40 lines |
-| 4 | `GetAsyncKeyState` polling (VK_CONTROL, VK_LBUTTON, VK_RBUTTON) races with ImGui input system in 2D mode | `main.cpp:2108,2122,2139,2187,2253,2263` | Medium | ~80 lines |
-| 5 | `ModelRenderer` destructor doesn't detach async load thread → potential crash on exit during load | `ModelRenderer.cpp:29` | Medium | ~10 lines |
-| 6 | `ModelRenderer::LoadModel()` declared in header (`ModelRenderer.h:20`) but never defined | `ModelRenderer.h` | Low | Dead declaration |
-| 7 | `m_pendingNormalPathW` never populated — normal map auto-load always falls back to flat `(128,128,255)` | `ModelRenderer.cpp:191` | Medium | ~40 lines |
-| 8 | `desktop.cddesk` exists in `build/` but no code reads/writes it — appears to be a planned persistence format | `build/desktop.cddesk` | — | — |
+| # | Issue | Status |
+|---|---|---|
+| 1 | `g_leftClicked` reset twice per frame | Fixed — removed duplicate reset |
+| 2 | `g_taskbarWindowIconCache` never prunes dead HWNDs | Fixed — prune every 60 frames |
+| 3 | 2D mode diagnostic spam → stuck-in-2D force-clear | Fixed — added force-clear at 600 frames |
+| 4 | `GetAsyncKeyState` polling races with ImGui | Fixed — replaced with message-driven `g_ctrlHeld`/`g_lButtonHeld` |
+| 5 | `ModelRenderer` destructor doesn't detach async load thread | Fixed — join thread in `Cleanup()` |
+| 6 | `ModelRenderer::LoadModel()` dead declaration | Fixed — removed declaration |
+| 7 | `m_pendingNormalPathW` never populated | Fixed — parse `map_Bump`/`bump` from MTL; keep fallback on load failure |
+| 8 | `desktop.cddesk` no read/write code | Resolved — `ScanDesktopForApps` handles desktop scanning |
 
 ## Feature Roadmap
 
 ### Phase 1 — Stability & Foundation (~620 lines, Debug: Med-High)
-| # | Feature | Lines | Difficulty | Dependencies |
-|---|---|---|---|---|
-| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None |
-| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None |
-| 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None |
-| 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None |
+| # | Feature | Lines | Difficulty | Dependencies | Status |
+|---|---|---|---|---|---|
+| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | Skipped (dev phase) |
+| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | Deferred (2.5k lines acceptable) |
+| 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None | ✅ |
+| 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None | ✅ |
 
 ### Phase 2 — Desktop Completeness (~880 lines, Debug: Medium)
-| # | Feature | Lines | Difficulty | Dependencies |
-|---|---|---|---|---|
-| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 |
-| 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 |
-| 2.3 | Camera movement (WASD + scroll zoom, `Camera::Move()` already implemented) | ~100 | Low | None |
-| 2.4 | Search engine (hook existing Start Menu search box, substring filter on apps/cubes) | ~160 | Low-Med | 2.1 |
+| # | Feature | Lines | Difficulty | Dependencies | Status |
+|---|---|---|---|---|---|
+| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | — |
+| 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 | — |
+| 2.3 | Camera movement (WASD + scroll zoom, `Camera::Move()` already implemented) | ~100 | Low | None | Removed (excluded from design) |
+| 2.4 | Search engine (hook existing Start Menu search box, substring filter on apps/cubes) | ~160 | Low-Med | 2.1 | ✅ |
 
 ### Phase 3 — Window Management (~740 lines, Debug: Med-High)
-| # | Feature | Lines | Difficulty | Dependencies |
-|---|---|---|---|---|
-| 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 |
-| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None |
-| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 |
+| # | Feature | Lines | Difficulty | Dependencies | Status |
+|---|---|---|---|---|---|
+| 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 | — |
+| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | — |
+| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | — |
 
 ### Phase 4 — Polish & Enhancement (~445 lines, Debug: Low-High)
-| # | Feature | Lines | Difficulty | Dependencies |
-|---|---|---|---|---|
-| 4.1 | Enable BloomRenderer (add to tasks.json, integration call) | ~35 | Low | None |
-| 4.2 | MTL parser: normal map (`map_Bump`) support, optional PBR shader upgrade | ~140 | Low-Med | None |
-| 4.3 | Dynamic system tray (enumerate background processes, replace hardcoded items) | ~90 | Low | None |
-| 4.4 | Shader hot-reload (file watcher thread + D3D pipeline recompile) | ~180 | **High** | None |
+| # | Feature | Lines | Difficulty | Dependencies | Status |
+|---|---|---|---|---|---|
+| 4.1 | Enable BloomRenderer (add to tasks.json, integration call) | ~35 | Low | None | Removed (abandoned) |
+| 4.2 | MTL parser: normal map (`map_Bump`) support, optional PBR shader upgrade | ~140 | Low-Med | None | ✅ |
+| 4.3 | Dynamic system tray (enumerate background processes, replace hardcoded items) | ~90 | Low | None | — |
+| 4.4 | Shader hot-reload (file watcher thread + D3D pipeline recompile) | ~180 | **High** | None | — |
 
 ### Phase 5 — Safety Nets & Shell Transition
-| # | Feature | Lines | Difficulty | Dependencies |
-|---|---|---|---|---|
-| 5.1 | Watchdog process | ~80 | Medium | None |
-| 5.2 | Task Manager emergency hotkey | ~30 | Low | None |
-| 5.3 | Tray icon proxy (Explorer toolbar subclassing) | ~300 | **High** | None |
-| 5.4 | Shell registration module (registry key swap, Explorer variant launch) | ~150 | Medium | 5.1-5.3 |
-| 5.5 | State machine verification | ~150 | Medium | None |
+| # | Feature | Lines | Difficulty | Dependencies | Status |
+|---|---|---|---|---|---|
+| 5.1 | Watchdog process | ~80 | Medium | None | ✅ |
+| 5.2 | Task Manager emergency hotkey | ~30 | Low | None | ✅ |
+| 5.3 | Tray icon proxy (Explorer toolbar subclassing) | ~300 | **High** | None | ✅ |
+| 5.4 | Shell registration module (registry key swap, Explorer variant launch) | ~150 | Medium | 5.1-5.3 | — |
+| 5.5 | State machine verification | ~150 | Medium | None | — |
 
 ### Phase 6 — Long-term (~730 lines)
 | # | Feature | Lines | Difficulty |

@@ -17,7 +17,6 @@ public:
     void Cleanup();
 
     // Load OBJ (uses Engine::ObjLoader) into GPU buffers
-    bool LoadModel(const std::string& filepath);
     bool LoadModelAsync(const std::string& filepath);
     // Poll on main thread to finalize any pending async loads (create D3D buffers, textures)
     void PollFinalizeLoad();

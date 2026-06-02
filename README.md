@@ -16,16 +16,21 @@ We pay homage to classic Windows designs but elevate them to a 3D spatial comput
 ## ✨ Core Features
 
 - **DirectX 11 Native Rendering Engine**: Built from scratch without bloated game engines. Ensures zero-overhead Win32 hooking, minimal RAM footprint, and ultimate OS-level control.
-- **Window Hijacking & Cloaking**: CrossDim intercepts native Windows applications (e.g., Task Manager, Explorer), strips away their legacy borders using DWM APIs, applies layered acrylic translucency, and embeds them into your 3D workspace.
+- **Window Hijacking & Cloaking**: CrossDim intercepts native Windows applications (e.g., Task Manager, Explorer), strips away their legacy borders using DWM APIs, and embeds them into your 3D workspace.
 - **Custom ImGui Taskbar & System Tray**: 
   - Completely hides the native Windows taskbar.
   - Dynamically enumerates running background apps and extracts their native `HICON`s to DX11 textures.
   - Custom-built system tray pulling real-time OS states via COM interfaces: Master Volume, Wi-Fi/Ethernet status, IME (Input Method), and Battery.
+  - Tray icon proxy reads Explorer's tray toolbar for third-party notification icons.
 - **Holographic Spatial Interactions**: 
-  - FPS-style Raycast targeting and app dragging.
-  - A unique mathematically-driven **3D Volumetric Curved Selection Box** that wraps perfectly around spherically arranged icons.
-- **Retina-Grade Floating Labels**: 3D coordinates are dynamically projected back to 2D screen space to render razor-sharp, distortion-free text labels using ImGui.
-- **High-Performance Asset Pipeline**: Includes a custom C-style multi-threaded `.obj/.mtl` loader capable of asynchronously loading 1M+ polygon models instantly. Features custom Half-Lambert shading and Fresnel Rim Lighting.
+  - FPS-style Raycast targeting and drag-and-drop in 3D space.
+  - Mouse wheel adjusts cube distance from camera during drag.
+  - Ctrl+click for multi-select.
+  - A unique mathematically-driven **3D Volumetric Curved Selection Box** that wraps around spherically arranged icons.
+- **Retina-Grade Floating Labels**: 3D coordinates are dynamically projected back to 2D screen space to render sharp, distortion-free text labels using ImGui.
+- **High-Performance Asset Pipeline**: Custom multi-threaded .obj/.mtl loader with .cdmesh binary cache. Half-Lambert shading, Fresnel Rim Lighting, tangent-space normal maps.
+- **Startup Search**: Case-insensitive substring filter for desktop cubes and start menu app tiles.
+- **Safety Nets**: Watchdog process (heartbeat monitoring, auto-restore Explorer shell on crash), Ctrl+Shift+Esc emergency Task Manager hotkey.
 
 ## 🚀 Roadmap
 

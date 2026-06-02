@@ -43,20 +43,6 @@ XMMATRIX Camera::GetProjectionMatrix(float fov, float aspectRatio, float nearZ, 
     return XMMatrixPerspectiveFovLH(XMConvertToRadians(fov), aspectRatio, nearZ, farZ);
 }
 
-void Camera::Move(float forwardAmount, float rightAmount, float speed) {
-    XMVECTOR pos = XMLoadFloat3(&Position);
-    XMVECTOR forward = XMLoadFloat3(&m_Forward);
-    XMVECTOR right = XMLoadFloat3(&m_Right);
-
-    XMVECTOR moveVec = XMVectorAdd(
-        XMVectorScale(forward, forwardAmount * speed),
-        XMVectorScale(right, rightAmount * speed)
-    );
-
-    pos = XMVectorAdd(pos, moveVec);
-    XMStoreFloat3(&Position, pos);
-}
-
 void Camera::Rotate(float dx, float dy, float sensitivity) {
     Rotation.y += dx * sensitivity;
     Rotation.x += dy * sensitivity;

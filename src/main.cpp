@@ -72,6 +72,8 @@ float g_mouseDeltaX = 0.0f;
 float g_mouseDeltaY = 0.0f;
 
 bool g_leftClicked = false;
+bool g_ctrlHeld = false;
+bool g_lButtonHeld = false;
 
 DWORD g_lastClickTime = 0;
 int   g_lastClickedApp = -1;
@@ -89,6 +91,8 @@ float g_dragCurrPitch = 0.0f;
 float g_dragPrevRawYaw = 0.0f;
 
 float g_fpsCurrent = 0.0f;
+char g_searchFilter[64] = "";
+float g_dragDistance = 8.0f;
 
 struct PendingHijack {
     HWND originalFocus;
@@ -505,6 +509,19 @@ static void LaunchAppByPath(LPCWSTR appPath) {
     }
 }
 
+static bool SearchMatch(const char* searchFilter, const std::string& label, const std::wstring& path) {
+    if (!searchFilter || searchFilter[0] == '\0') return true;
+    std::string filter(searchFilter);
+    for (auto& c : filter) c = (char)tolower((unsigned char)c);
+    std::string lcLabel = label;
+    for (auto& c : lcLabel) c = (char)tolower((unsigned char)c);
+    if (lcLabel.find(filter) != std::string::npos) return true;
+    std::string lcPath;
+    for (wchar_t ch : path) lcPath += (char)tolower((unsigned char)ch);
+    if (lcPath.find(filter) != std::string::npos) return true;
+    return false;
+}
+
 static void ScanDesktopForApps(std::vector<AppCube>& outApps) {
     WCHAR desktopPaths[2][MAX_PATH];
     int pathCount = 0;
@@ -559,25 +576,29 @@ static void ScanDesktopForApps(std::vector<AppCube>& outApps) {
     }
     const int count = (int)entries.size();
     if (count == 0) return;
-    const int rows = (count <= 5) ? 1 : (count <= 12) ? 2 : (count <= 24) ? 3 : 4;
-    const float xSpan = 12.0f, yStart = 4.5f, yStep = 3.0f, zBase = 8.0f;
-    int idx = 0;
-    for (int r = 0; r < rows && idx < count; ++r) {
-        int perRow = (count + rows - 1) / rows;
-        int start = r * perRow, end = (r + 1) * perRow;
-        if (end > count) end = count;
-        int n = end - start;
-        for (int c = 0; c < n; ++c) {
-            float x = (n <= 1) ? 0.0f : (-xSpan * 0.5f + xSpan * c / (float)(n - 1));
-            float y = yStart - r * yStep;
-            AppCube cube = {};
-            cube.Position = DirectX::XMFLOAT3(x, y, zBase);
-            cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
-            cube.AppPath = entries[idx].first;
-            cube.AppName = entries[idx].second;
-            outApps.push_back(cube);
-            idx++;
-        }
+    const float radius = 8.0f;
+    const DirectX::XMFLOAT3 sphereCenter = { 0.0f, 1.5f, 0.0f };
+    int cols = (int)ceilf(sqrtf((float)count * 1.6f));
+    if (cols < 1) cols = 1;
+    int rows = (count + cols - 1) / cols;
+    const float yawMin = DirectX::XMConvertToRadians(-50.0f);
+    const float yawMax = DirectX::XMConvertToRadians(15.0f);
+    const float pitchMax = DirectX::XMConvertToRadians(30.0f);
+    const float pitchMin = DirectX::XMConvertToRadians(-28.0f);
+    for (int idx = 0; idx < count; ++idx) {
+        int col = idx % cols;
+        int row = idx / cols;
+        float yaw = (cols > 1) ? yawMin + (yawMax - yawMin) * col / (float)(cols - 1) : (yawMin + yawMax) * 0.5f;
+        float pitch = (rows > 1) ? pitchMax + (pitchMin - pitchMax) * row / (float)(rows - 1) : (pitchMax + pitchMin) * 0.5f;
+        float dx = sinf(yaw) * cosf(pitch);
+        float dy = sinf(pitch);
+        float dz = cosf(yaw) * cosf(pitch);
+        AppCube cube = {};
+        cube.Position = DirectX::XMFLOAT3(sphereCenter.x + dx * radius, sphereCenter.y + dy * radius, sphereCenter.z + dz * radius);
+        cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
+        cube.AppPath = entries[idx].first;
+        cube.AppName = entries[idx].second;
+        outApps.push_back(cube);
     }
 }
 
@@ -674,10 +695,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (pi.hThread) CloseHandle(pi.hThread);
         return 0;
     }
+    if (msg == WM_HOTKEY && wParam == 3) {
+        LOG("=== Cube Layout Dump (%zu cubes) ===", g_myApps.size());
+        for (size_t i = 0; i < g_myApps.size(); ++i) {
+            const auto& a = g_myApps[i];
+            LOG("  [%2zu] name=%-24s  pos=(% 6.2f, % 6.2f, % 6.2f)",
+                i, a.AppName.c_str(), a.Position.x, a.Position.y, a.Position.z);
+        }
+        LOG("=== End Dump ===");
+        return 0;
+    }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
         toggleUiUnlock(hWnd);
         return 0;
     }
+
+    if (msg == WM_KEYDOWN && wParam == VK_CONTROL) g_ctrlHeld = true;
+    if (msg == WM_KEYUP && wParam == VK_CONTROL) g_ctrlHeld = false;
+    if (msg == WM_LBUTTONUP) g_lButtonHeld = false;
 
     bool imguiHandled = false;
     if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
@@ -751,6 +786,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         case WM_LBUTTONDOWN: {
+            g_lButtonHeld = true;
             if (g_currentState == STATE_3D_EXPLORE) {
                 g_leftClicked = true;
             } 
@@ -778,6 +814,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
+        case WM_LBUTTONUP: {
+            g_lButtonHeld = false;
+            break;
+        }
+        case WM_MOUSEWHEEL: {
+            if (g_isDragging && g_grabbedAppIndex != -1) {
+                float delta = (float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA;
+                g_dragDistance -= delta * 0.5f;
+                if (g_dragDistance < 3.0f) g_dragDistance = 3.0f;
+                if (g_dragDistance > 20.0f) g_dragDistance = 20.0f;
+            }
+            return 0;
+        }
         case WM_INPUT: {
             if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                 RAWINPUT raw;
@@ -792,8 +841,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return DefWindowProc(hWnd, msg, wParam, lParam);
         }
-        case WM_KEYDOWN: 
+        case WM_KEYDOWN:
+            if (wParam == VK_CONTROL) g_ctrlHeld = true;
             if (wParam == VK_ESCAPE) PostQuitMessage(0);
+            return 0;
+
+        case WM_KEYUP:
+            if (wParam == VK_CONTROL) g_ctrlHeld = false;
             return 0;
 
         case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -822,6 +876,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     g_mainHwnd = hwnd;
     g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
     RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_ESCAPE);
+    RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'D');
+    Logger::Instance().Init();
     SetSystemTaskbarVisible(false);
     DragAcceptFiles(hwnd, TRUE);
     RAWINPUTDEVICE rid[1];
@@ -903,6 +959,27 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             if (msg.message == WM_QUIT) done = true;
         }
         if (done) break;
+
+        {
+            static int s_pruneFrames = 0;
+            if (++s_pruneFrames >= 60) {
+                s_pruneFrames = 0;
+                for (auto it = g_taskbarWindowIconCache.begin(); it != g_taskbarWindowIconCache.end(); ) {
+                    if (!IsWindow(it->first)) {
+                        if (it->second) it->second->Release();
+                        it = g_taskbarWindowIconCache.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                for (auto it = g_taskbarDynamicOrder.begin(); it != g_taskbarDynamicOrder.end(); ) {
+                    if (!IsWindow(it->first))
+                        it = g_taskbarDynamicOrder.erase(it);
+                    else
+                        ++it;
+                }
+            }
+        }
 
         static ULONGLONG lastTick = GetTickCount64();
         ULONGLONG nowTick = GetTickCount64();
@@ -1592,12 +1669,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 panelDraw->AddRect(q0, q1, IM_COL32(255, 255, 255, 120), panelRound, 0, 1.0f);
 
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.15f, 0.18f, 0.24f, 1.0f));
-                static char startSearch[64] = "";
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f * scale);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 6.0f * scale));
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1.0f, 1.0f, 1.0f, 0.22f));
                 ImGui::SetNextItemWidth(-1);
-                ImGui::InputText("##StartSearch", startSearch, sizeof(startSearch));
+                ImGui::InputText("##StartSearch", g_searchFilter, sizeof(g_searchFilter));
                 ImGui::PopStyleColor();
                 ImGui::PopStyleVar(2);
 
@@ -1623,6 +1699,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
                 for (int i = 0; i < (int)taskbarPinned.size(); ++i) {
                     if (taskbarPinned[i].IconKind != TASKBAR_ICON_APP) continue;
+                    if (g_searchFilter[0] && !SearchMatch(g_searchFilter, taskbarPinned[i].Label, taskbarPinned[i].AppPath)) continue;
                     ImGui::PushID(i);
                     ImGui::SetCursorScreenPos(ImVec2(gridX, gridY));
                     ImGui::InvisibleButton("StartTile", ImVec2(tileW, tileH));
@@ -2107,7 +2184,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     g_lastClickTime = GetTickCount();
                     g_lastClickedApp = hitAppIndex;
                     
-                    if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+                    if (!(g_ctrlHeld)) {
                         if (!g_myApps[hitAppIndex].IsSelected) {
                             for (auto& a : g_myApps) a.IsSelected = false;
                         }
@@ -2117,11 +2194,15 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                         g_grabbedAppIndex = hitAppIndex;
                         g_mouseDownTime = GetTickCount();
+                        DirectX::XMVECTOR cPos = DirectX::XMLoadFloat3(&camera.Position);
+                        DirectX::XMVECTOR aPos = DirectX::XMLoadFloat3(&g_myApps[hitAppIndex].Position);
+                        g_dragDistance = DirectX::XMVectorGetX(DirectX::XMVector3Length(DirectX::XMVectorSubtract(aPos, cPos)));
+                        if (g_dragDistance < 3.0f) g_dragDistance = 8.0f;
                     }
                 }
             } else {
                 for (auto& a : g_myApps) {
-                    if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) a.IsSelected = false;
+                    if (!(g_ctrlHeld)) a.IsSelected = false;
                     a.WasSelected = a.IsSelected;
                 }
                 if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
@@ -2135,15 +2216,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     g_dragPrevRawYaw = startAngle.x;
                 }
             }
-            g_leftClicked = false; 
         }
 
-        if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+        if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (g_lButtonHeld)) {
             if (g_grabbedAppIndex != -1) {
                 if (GetTickCount() - g_mouseDownTime > 150) {
                     g_isDragging = true;
                     
-                    DirectX::XMVECTOR newPosVec = DirectX::XMVectorAdd(rayOrigin, DirectX::XMVectorScale(rayDir, 8.0f));
+                    DirectX::XMVECTOR newPosVec = DirectX::XMVectorAdd(rayOrigin, DirectX::XMVectorScale(rayDir, g_dragDistance));
                     DirectX::XMFLOAT3 targetPos; DirectX::XMStoreFloat3(&targetPos, newPosVec);
                     
                     DirectX::XMFLOAT3 delta = { 
@@ -2152,10 +2232,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                         targetPos.z - g_myApps[g_grabbedAppIndex].Position.z 
                     };
 
-                    constexpr float COL_RADIUS = 0.80f;
+                    constexpr float COL_RADIUS = 0.40f;
                     constexpr float COL_DIAM = COL_RADIUS * 2.0f;
-                    constexpr float REPEL_DIST = 2.0f;
-                    constexpr float REPEL_FORCE = 0.12f;
+                    constexpr float REPEL_DIST = 1.2f;
+                    constexpr float REPEL_FORCE = 0.10f;
 
                     for (int i = 0; i < (int)g_myApps.size(); ++i) {
                         if (!g_myApps[i].IsSelected) continue;
@@ -2230,7 +2310,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     
                     bool inside = (abs(dy) <= extYaw && abs(appAngle.y - centerPitch) <= extPitch);
                     
-                    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) a.IsSelected = (a.WasSelected || inside);
+                    if (g_ctrlHeld) a.IsSelected = (a.WasSelected || inside);
                     else a.IsSelected = inside;
                 }
             }
@@ -2269,6 +2349,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 hoverState = app.IsSelected ? (app.IsHovered ? 3 : 2) : (app.IsHovered ? 1 : 0);
             }
             DirectX::XMFLOAT3 appScale = {1.2f, 1.2f, 0.6f}; 
+            DirectX::XMFLOAT4 drawColor = app.BaseColor;
+            if (g_searchFilter[0]) {
+                if (!SearchMatch(g_searchFilter, app.AppName, app.AppPath)) {
+                    drawColor = DirectX::XMFLOAT4(app.BaseColor.x * 0.15f, app.BaseColor.y * 0.15f, app.BaseColor.z * 0.15f, 0.3f);
+                }
+            }
             float spinAngle = 0.0f;
             float orbitAngle = 0.0f;
             float tiltAngle = 0.0f;
@@ -2277,7 +2363,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 orbitAngle = appSpinTime * 0.8f;
                 tiltAngle = 0.55f;
             }
-            cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, app.Position, appScale, app.BaseColor, app.IconTexture, camera.Position, hoverState, viewMatrix, 8.0f, spinAngle, orbitAngle, tiltAngle);
+            cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, app.Position, appScale, drawColor, app.IconTexture, camera.Position, hoverState, viewMatrix, 8.0f, spinAngle, orbitAngle, tiltAngle);
             
             // 🚨 3D 全息投影到 2D 屏幕文字
             DirectX::XMVECTOR appPos = DirectX::XMLoadFloat3(&app.Position);

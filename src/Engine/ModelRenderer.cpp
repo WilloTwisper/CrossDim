@@ -28,8 +28,9 @@ ModelRenderer::ModelRenderer() : m_device(nullptr), m_vs(nullptr), m_ps(nullptr)
 
 ModelRenderer::~ModelRenderer() { Cleanup(); }
 
-void ModelRenderer::Cleanup() { /* ... 清理代码保持不变 ... */ 
-    if (m_rasterizerState) { m_rasterizerState->Release(); m_rasterizerState = nullptr; } // 🚨 新增清理
+void ModelRenderer::Cleanup() {
+    if (m_loadThread.joinable()) m_loadThread.join();
+    if (m_rasterizerState) { m_rasterizerState->Release(); m_rasterizerState = nullptr; }
     if (m_cb) { m_cb->Release(); m_cb = nullptr; }
     if (m_ib) { m_ib->Release(); m_ib = nullptr; }
     if (m_vb) { m_vb->Release(); m_vb = nullptr; }
@@ -188,7 +189,16 @@ bool ModelRenderer::LoadModelAsync(const std::string& filepath) {
                         if (!m_pendingDiffusePathW.empty() && m_pendingDiffusePathW.back() == L'\0') m_pendingDiffusePathW.pop_back();
                     }
                 }
-                // 忽略 Bump 解析以节省篇幅，核心漫反射已修复
+                if (line.rfind("map_Bump", 0) == 0 || line.rfind("bump ", 0) == 0) {
+                    std::string tex = ExtractLastToken(line);
+                    std::string full = baseDir + tex;
+                    int plen = MultiByteToWideChar(CP_UTF8, 0, full.c_str(), -1, NULL, 0);
+                    if (plen > 0) {
+                        m_pendingNormalPathW.resize(plen);
+                        MultiByteToWideChar(CP_UTF8, 0, full.c_str(), -1, &m_pendingNormalPathW[0], plen);
+                        if (!m_pendingNormalPathW.empty() && m_pendingNormalPathW.back() == L'\0') m_pendingNormalPathW.pop_back();
+                    }
+                }
             }
         }
     }
@@ -301,15 +311,19 @@ void ModelRenderer::PollFinalizeLoad() {
 }
 
 bool ModelRenderer::SetDiffuseTexture(const std::wstring& path) {
-    if (m_diffuseSRV) { m_diffuseSRV->Release(); m_diffuseSRV = nullptr; }
-    m_diffuseSRV = TextureLoader::LoadTextureFromFile(m_device, path);
-    return m_diffuseSRV != nullptr;
+    ID3D11ShaderResourceView* srv = TextureLoader::LoadTextureFromFile(m_device, path);
+    if (!srv) return false;
+    if (m_diffuseSRV) m_diffuseSRV->Release();
+    m_diffuseSRV = srv;
+    return true;
 }
 
 bool ModelRenderer::SetNormalTexture(const std::wstring& path) {
-    if (m_normalSRV) { m_normalSRV->Release(); m_normalSRV = nullptr; }
-    m_normalSRV = TextureLoader::LoadTextureFromFile(m_device, path);
-    return m_normalSRV != nullptr;
+    ID3D11ShaderResourceView* srv = TextureLoader::LoadTextureFromFile(m_device, path);
+    if (!srv) return false;
+    if (m_normalSRV) m_normalSRV->Release();
+    m_normalSRV = srv;
+    return true;
 }
 
 // 🚨 更新签名
