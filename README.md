@@ -1,55 +1,73 @@
-# CrossDim 🌌
+# CrossDim
+
 **The World Outside Windows.**
 
 ![C++](https://img.shields.io/badge/Language-C++17-blue.svg)
 ![DirectX](https://img.shields.io/badge/Graphics-DirectX%2011-lightgreen.svg)
 ![ImGui](https://img.shields.io/badge/UI-Dear%20ImGui-red.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)
+![Version](https://img.shields.io/badge/Version-v0.0.7-informational.svg)
 
-> *CrossDim is a next-generation Spatial OS Shell built from scratch. Currently a Work in Progress (WIP).*
+CrossDim is a native C++ spatial OS shell. Currently runs as a 3D overlay on top of Explorer.exe; the end goal is to replace Explorer as the primary Windows shell.
 
-## 📖 Philosophy: "Old Face, New Experience"
-CrossDim is not just a 3D wallpaper or a fancy launcher. It is an ambitious **Native C++ Spatial Desktop Environment** designed to break the boundaries of the traditional 2D desktop. 
+## Philosophy
 
-We pay homage to classic Windows designs but elevate them to a 3D spatial computing environment. We believe in **"Old face, new experience"**—classic interactions (like dragging a selection box or taskbar management) are elegantly translated into 3D holographic mechanisms without sacrificing productivity or user intuition.
+We translate classic desktop metaphors (taskbar, icons, window management, drag-and-drop) into a 3D spatial environment — not a game engine. Every interaction must feel intuitive and productive. The design follows: **"same mental model, spatial execution."**
 
-## ✨ Core Features
+## Current State (v0.0.7)
 
-- **DirectX 11 Native Rendering Engine**: Built from scratch without bloated game engines. Ensures zero-overhead Win32 hooking, minimal RAM footprint, and ultimate OS-level control.
-- **Window Hijacking & Cloaking**: CrossDim intercepts native Windows applications (e.g., Task Manager, Explorer), strips away their legacy borders using DWM APIs, and embeds them into your 3D workspace.
-- **Custom ImGui Taskbar & System Tray**: 
-  - Completely hides the native Windows taskbar.
-  - Dynamically enumerates running background apps and extracts their native `HICON`s to DX11 textures.
-  - Custom-built system tray pulling real-time OS states via COM interfaces: Master Volume, Wi-Fi/Ethernet status, IME (Input Method), and Battery.
-  - Tray icon proxy reads Explorer's tray toolbar for third-party notification icons.
-- **Holographic Spatial Interactions**: 
-  - FPS-style Raycast targeting and drag-and-drop in 3D space.
-  - Mouse wheel adjusts cube distance from camera during drag.
-  - Ctrl+click for multi-select.
-  - A unique mathematically-driven **3D Volumetric Curved Selection Box** that wraps around spherically arranged icons.
-- **Retina-Grade Floating Labels**: 3D coordinates are dynamically projected back to 2D screen space to render sharp, distortion-free text labels using ImGui.
-- **High-Performance Asset Pipeline**: Custom multi-threaded .obj/.mtl loader with .cdmesh binary cache. Half-Lambert shading, Fresnel Rim Lighting, tangent-space normal maps.
-- **Startup Search**: Case-insensitive substring filter for desktop cubes and start menu app tiles.
-- **Safety Nets**: Watchdog process (heartbeat monitoring, auto-restore Explorer shell on crash), Ctrl+Shift+Esc emergency Task Manager hotkey.
+| Subsystem | Coverage |
+|---|---|
+| Desktop (3D icon cubes, spherical layout, drag-and-drop) | ~30% |
+| Window management (hijack, chrome, edge snapping) | ~35% |
+| Taskbar + system tray (IME, audio, network, battery) | ~55% |
+| Start menu + search | ~40% |
+| File system integration (scan, icon load, persistence) | ~30% |
+| Safety nets (watchdog, emergency hotkey) | 100% |
 
-## 🚀 Roadmap
+**Weighted coverage: ~22%** of the full shell vision.
 
-- [ ] **Physics-Based Drag & Drop**: Spring-lerp physics for moving individual or bulk-selected 3D application nodes.
-- [ ] **Cross-Dimensional Pinning**: Drag an app from the 3D space directly onto the 2D taskbar to pin it.
-- [ ] **Holographic Context Menus**: 3D projected right-click menus for applications.
-- [ ] **Real-time App Streaming (DXGI)**: Capturing active native window contents and streaming them onto 3D planes within the environment (True Spatial Computing).
-- [ ] **Spatial Folders**: Tesseract-like 3D folder navigation arrays.
+## Features
 
-## 🛠️ Building & Compilation
+- **DirectX 11 native rendering** — skybox, 3D icon cubes, OBJ model loading with Half-Lambert shading and normal maps
+- **Window hijacking** — intercepts Win32 windows, strips legacy chrome, embeds them in 2D workbench mode with custom title bar
+- **ImGui taskbar** — replaces the Windows taskbar: pinned apps, running window list, start menu, system tray popup
+- **System indicators** — real-time audio volume, IME input method, network status, battery, clock via COM/Win32 APIs
+- **3D cube interaction** — FPS-style raycast targeting, drag-and-drop with collision physics, marquee spherical sector selection, Ctrl+click multi-select
+- **Window snapping** — drag to screen edges for half/full/quarter layouts, Ctrl+Alt+Arrow shortcuts, blue preview overlay
+- **Desktop persistence** — cube positions saved to `desktop.cddesk`; external drag-drop cubes survive restarts; Delete key and right-click context menu for cube removal
+- **Safety nets** — watchdog process monitors heartbeat and restores Explorer on crash; Ctrl+Shift+Esc emergency Task Manager hotkey
 
-The project is heavily optimized for **MSVC (cl.exe)** with extreme optimization flags (`/O2`). A build task is provided out-of-the-box for Visual Studio Code. You must have **Visual Studio Build Tools** installed with C++ desktop development support.
+## Project Structure
 
-1. Open this repository folder in VS Code.
-2. Press `Ctrl + Shift + B` (Run Build Task) to compile the engine via the pre-configured `tasks.json`.
-3. The executable will be generated in `\build\CrossDim.exe`.
-4. *(Required)* Run the executable as **Administrator** to successfully hijack high-privilege windows (like Task Manager).
+```
+src/
+├── main.cpp                          # Entry point, state machine, WndProc, render loop
+├── Engine/
+│   ├── Camera.h / .cpp               # FPS-style camera
+│   ├── SkyboxRenderer.h / .cpp       # Procedural skybox
+│   ├── CubeRenderer.h / .cpp         # 3D icon cube geometry
+│   ├── ModelRenderer.h / .cpp        # Async OBJ model loader + shader
+│   ├── ObjLoader.h / .cpp            # OBJ/MTL parser with .cdmesh cache
+│   ├── Logger.h                      # Header-only singleton (logs/ dir, auto-prune)
+│   ├── TextureLoader.h               # Header-only D3D texture/icon utilities
+│   └── TrayProxy.h                   # Header-only Explorer tray icon reader
+├── Shell/
+│   ├── DesktopManager.h              # AppCube, desktop scan, persistence, search
+│   ├── WindowManager.h               # Window enumeration, hijack queue, icon cache
+│   └── SystemInfo.h                  # Audio, IME, network, battery status
+vendor/
+└── imgui/                            # Dear ImGui (Docking branch)
+```
 
-## 📄 License and Attribution
-- **Source Code**: [Specify your open-source license here, e.g., MIT]
-- **Dear ImGui**: Included via `vendor/imgui/`. MIT Licensed.
-- **Disclaimer**: Certain 3D models and textures in the `assets/` directory are for testing purposes. Please ensure you hold the proper commercial rights for your own assets when deploying.
+## Build
+
+- **Prerequisite:** Visual Studio 2022 Build Tools with C++ desktop workload
+- **Build:** `Ctrl+Shift+B` in VS Code (runs `.vscode/tasks.json`)
+- **Output:** `build\CrossDim.exe`
+- **Flags:** `/O2 /EHsc /std:c++17`
+- **Must run as Administrator** for high-privilege window hijacking
+
+## License
+
+Source code TBD. Dear ImGui included under MIT license.
