@@ -6,5 +6,7 @@ build/
 *.ilk
 imgui.ini
 *.cdmesh
+desktop.cddesk
+logs/
 assets/bloom_high/*.obj
 

@@ -37,6 +37,9 @@
 #include "Engine/ModelRenderer.h"
 #include "Engine/Logger.h"
 #include "Engine/TrayProxy.h"
+#include "Shell/DesktopManager.h"
+#include "Shell/WindowManager.h"
+#include "Shell/SystemInfo.h"
 enum CrossDimState {
     STATE_3D_EXPLORE,
     STATE_2D_WORKBENCH
@@ -78,10 +81,13 @@ bool g_lButtonHeld = false;
 DWORD g_lastClickTime = 0;
 int   g_lastClickedApp = -1;
 
-int   g_grabbedAppIndex = -1;  
-bool  g_isDragging = false;    
+int   g_grabbedAppIndex = -1;
+bool  g_isDragging = false;
 DWORD g_mouseDownTime = 0;
-int   g_dropTargetIndex = -1;     
+int   g_dropTargetIndex = -1;
+int   g_rightClickedCubeIndex = -1;
+bool  g_rightClicked = false;
+bool  g_deleteRequested = false;
 
 bool  g_isBlankDragging = false;
 float g_dragStartYaw = 0.0f;
@@ -93,348 +99,6 @@ float g_dragPrevRawYaw = 0.0f;
 float g_fpsCurrent = 0.0f;
 char g_searchFilter[64] = "";
 float g_dragDistance = 8.0f;
-
-struct PendingHijack {
-    HWND originalFocus;
-    int frameWait;
-    DWORD processId;
-};
-std::vector<PendingHijack> g_pendingHijacks;
-
-struct HijackedWindow {
-    HWND hwnd;
-};
-std::vector<HijackedWindow> g_hijackedWindows;
-
-std::unordered_map<std::wstring, ID3D11ShaderResourceView*> g_taskbarIconCache;
-std::unordered_map<HWND, ID3D11ShaderResourceView*> g_taskbarWindowIconCache;
-std::unordered_map<HWND, int> g_taskbarDynamicOrder;
-int g_taskbarDynamicOrderCounter = 1;
-
-IAudioEndpointVolume* g_audioEndpoint = nullptr;
-
-struct EnumData {
-    DWORD processId;
-    HWND hwnd;
-};
-
-DirectX::XMFLOAT2 GetYawPitch(DirectX::XMVECTOR dirVec) {
-    DirectX::XMFLOAT3 dir; 
-    DirectX::XMStoreFloat3(&dir, dirVec);
-    float yaw = atan2(dir.x, dir.z);
-    float pitch = asin(dir.y / sqrt(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z));
-    return {yaw, pitch};
-}
-
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    EnumData* data = (EnumData*)lParam;
-    
-    if (pid == data->processId && GetWindow(hwnd, GW_OWNER) == NULL && IsWindowVisible(hwnd)) {
-        WCHAR title[256];
-        GetWindowTextW(hwnd, title, 256);
-        if (wcslen(title) > 0) {
-            data->hwnd = hwnd;
-            return FALSE; 
-        }
-    }
-    return TRUE;
-}
-
-HWND FindWindowFromProcessId(DWORD pid) {
-    EnumData data = { pid, NULL };
-    EnumWindows(EnumWindowsProc, (LPARAM)&data);
-    return data.hwnd;
-}
-
-bool InitAudioEndpointVolume() {
-    if (g_audioEndpoint) return true;
-    IMMDeviceEnumerator* enumerator = nullptr;
-    IMMDevice* device = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(&enumerator));
-    if (FAILED(hr)) return false;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (SUCCEEDED(hr)) {
-        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER, nullptr,
-                              (void**)&g_audioEndpoint);
-    }
-    if (device) device->Release();
-    if (enumerator) enumerator->Release();
-    return SUCCEEDED(hr) && g_audioEndpoint != nullptr;
-}
-
-void ShutdownAudioEndpointVolume() {
-    if (g_audioEndpoint) {
-        g_audioEndpoint->Release();
-        g_audioEndpoint = nullptr;
-    }
-}
-
-float GetMasterVolumeLevelScalar() {
-    float level = 0.7f;
-    if (g_audioEndpoint) {
-        float v = 0.0f;
-        if (SUCCEEDED(g_audioEndpoint->GetMasterVolumeLevelScalar(&v))) {
-            level = v;
-        }
-    }
-    if (level < 0.0f) level = 0.0f;
-    if (level > 1.0f) level = 1.0f;
-    return level;
-}
-
-void GetImeLabel(HWND hwnd, char* buffer, size_t bufferSize) {
-    if (!buffer || bufferSize == 0) return;
-    strcpy_s(buffer, bufferSize, "英 ENG");
-    HIMC imc = ImmGetContext(hwnd);
-    if (!imc) return;
-    if (ImmGetOpenStatus(imc)) {
-        strcpy_s(buffer, bufferSize, "中 拼");
-    }
-    ImmReleaseContext(hwnd, imc);
-}
-
-static bool GetImeOpenStatus(HWND hwnd) {
-    HIMC imc = ImmGetContext(hwnd);
-    if (!imc) return false;
-    BOOL open = ImmGetOpenStatus(imc);
-    ImmReleaseContext(hwnd, imc);
-    return open != FALSE;
-}
-
-static void SetImeOpenStatus(HWND hwnd, bool open) {
-    HIMC imc = ImmGetContext(hwnd);
-    if (!imc) return;
-    ImmSetOpenStatus(imc, open ? TRUE : FALSE);
-    ImmReleaseContext(hwnd, imc);
-}
-
-static bool IsChineseImeLayout() {
-    HKL hkl = GetKeyboardLayout(0);
-    LANGID lang = LOWORD((UINT_PTR)hkl);
-    return PRIMARYLANGID(lang) == LANG_CHINESE;
-}
-
-static void ActivateImeLayout(HWND hwnd, LPCWSTR klid, bool open) {
-    HKL hkl = LoadKeyboardLayoutW(klid, KLF_ACTIVATE);
-    if (hkl) ActivateKeyboardLayout(hkl, 0);
-    SetImeOpenStatus(hwnd, open);
-}
-
-struct NetworkStatus {
-    bool connected;
-    bool wifi;
-    bool ethernet;
-};
-
-NetworkStatus GetNetworkStatus() {
-    NetworkStatus status = { false, false, false };
-    ULONG size = 0;
-    DWORD flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size);
-    if (size == 0) return status;
-
-    std::vector<unsigned char> buffer(size);
-    IP_ADAPTER_ADDRESSES* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &size) != NO_ERROR) {
-        return status;
-    }
-
-    for (IP_ADAPTER_ADDRESSES* it = addrs; it != nullptr; it = it->Next) {
-        if (it->OperStatus != IfOperStatusUp) continue;
-        if (it->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        status.connected = true;
-        if (it->IfType == IF_TYPE_IEEE80211) {
-            status.wifi = true;
-        } else if (it->IfType == IF_TYPE_ETHERNET_CSMACD) {
-            status.ethernet = true;
-        } else {
-            status.ethernet = true;
-        }
-    }
-    return status;
-}
-
-struct RunningWindow {
-    HWND hwnd;
-    DWORD pid;
-    std::wstring path;
-    std::wstring title;
-};
-
-struct WindowEnumContext {
-    HWND exclude;
-    std::vector<RunningWindow>* out;
-};
-
-static std::wstring GetProcessPath(DWORD pid) {
-    std::wstring path;
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!hProc) return path;
-    WCHAR buffer[MAX_PATH];
-    DWORD size = MAX_PATH;
-    if (QueryFullProcessImageNameW(hProc, 0, buffer, &size)) {
-        path.assign(buffer, size);
-    }
-    CloseHandle(hProc);
-    return path;
-}
-
-static bool IsTaskbarWindowCandidate(HWND hwnd, HWND exclude) {
-    if (!IsWindowVisible(hwnd)) return false;
-    if (hwnd == exclude) return false;
-    if (GetWindow(hwnd, GW_OWNER) != NULL) return false;
-    LONG style = GetWindowLong(hwnd, GWL_STYLE);
-    if (style & WS_CHILD) return false;
-    LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) return false;
-    if (exStyle & WS_EX_NOACTIVATE) return false;
-    BOOL cloaked = FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
-    char className[256];
-    GetClassNameA(hwnd, className, 256);
-    if (strcmp(className, "Shell_TrayWnd") == 0 || strcmp(className, "Progman") == 0) return false;
-    WCHAR title[256];
-    if (GetWindowTextW(hwnd, title, 256) == 0) return false;
-    return true;
-}
-
-static BOOL CALLBACK EnumRunningWindowsProc(HWND hwnd, LPARAM lParam) {
-    auto ctx = reinterpret_cast<WindowEnumContext*>(lParam);
-    if (!IsTaskbarWindowCandidate(hwnd, ctx->exclude)) return TRUE;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == 0) return TRUE;
-
-    RunningWindow win = {};
-    win.hwnd = hwnd;
-    win.pid = pid;
-    win.path = GetProcessPath(pid);
-    WCHAR title[256];
-    GetWindowTextW(hwnd, title, 256);
-    win.title = title;
-    ctx->out->push_back(win);
-    return TRUE;
-}
-
-static std::vector<RunningWindow> EnumerateRunningWindows(HWND exclude) {
-    std::vector<RunningWindow> out;
-    WindowEnumContext ctx = { exclude, &out };
-    EnumWindows(EnumRunningWindowsProc, (LPARAM)&ctx);
-    return out;
-}
-
-static bool IsSamePath(const std::wstring& a, const std::wstring& b) {
-    if (a.empty() || b.empty()) return false;
-    if (_wcsicmp(a.c_str(), b.c_str()) == 0) return true;
-    size_t posA = a.rfind(L'\\');
-    size_t posB = b.rfind(L'\\');
-    if (posA != std::wstring::npos && posB != std::wstring::npos) {
-        return _wcsicmp(a.c_str() + posA, b.c_str() + posB) == 0;
-    }
-    return false;
-}
-
-struct FindHwndCtx { std::wstring exe; HWND result; };
-static BOOL CALLBACK FindHwndByExeProc(HWND hwnd, LPARAM lParam) {
-    FindHwndCtx* ctx = reinterpret_cast<FindHwndCtx*>(lParam);
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (!pid) return TRUE;
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProc) return TRUE;
-    WCHAR buf[MAX_PATH];
-    DWORD sz = MAX_PATH;
-    BOOL ok = QueryFullProcessImageNameW(hProc, 0, buf, &sz);
-    CloseHandle(hProc);
-    if (!ok) return TRUE;
-    std::wstring p(buf, sz);
-    size_t pos = p.rfind(L'\\');
-    if (pos != std::wstring::npos && _wcsicmp(p.c_str() + pos, ctx->exe.c_str()) == 0) {
-        ctx->result = hwnd;
-        return FALSE;
-    }
-    return TRUE;
-}
-static HWND FindRunningHwnd(const std::wstring& appPath) {
-    size_t pos = appPath.rfind(L'\\');
-    std::wstring exe = (pos != std::wstring::npos) ? appPath.substr(pos) : appPath;
-    FindHwndCtx ctx = { exe, nullptr };
-    EnumWindows(FindHwndByExeProc, (LPARAM)&ctx);
-    return ctx.result;
-}
-
-static ID3D11ShaderResourceView* GetTaskbarIcon(ID3D11Device* device, const std::wstring& path) {
-    if (path.empty() || !device) return nullptr;
-    auto it = g_taskbarIconCache.find(path);
-    if (it != g_taskbarIconCache.end()) return it->second;
-    ID3D11ShaderResourceView* icon = TextureLoader::LoadIconFromExe(device, path.c_str());
-    g_taskbarIconCache[path] = icon;
-    return icon;
-}
-
-static void SetSystemTaskbarVisible(bool visible) {
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (tray) ShowWindow(tray, visible ? SW_SHOW : SW_HIDE);
-    HWND secondary = nullptr;
-    while (true) {
-        secondary = FindWindowExW(nullptr, secondary, L"Shell_SecondaryTrayWnd", nullptr);
-        if (!secondary) break;
-        ShowWindow(secondary, visible ? SW_SHOW : SW_HIDE);
-    }
-    g_systemTaskbarHidden = !visible;
-}
-
-static HICON GetWindowBestIcon(HWND hwnd) {
-    if (!hwnd) return nullptr;
-    HICON hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
-    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
-    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
-    if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
-    if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
-    return hIcon;
-}
-
-static ID3D11ShaderResourceView* GetWindowIconTexture(ID3D11Device* device, HWND hwnd, const std::wstring& path) {
-    if (!device || !hwnd) return GetTaskbarIcon(device, path);
-    auto it = g_taskbarWindowIconCache.find(hwnd);
-    if (it != g_taskbarWindowIconCache.end() && it->second) return it->second;
-    ID3D11ShaderResourceView* icon = nullptr;
-    HICON hIcon = GetWindowBestIcon(hwnd);
-    if (hIcon) {
-        icon = TextureLoader::LoadIconFromHandle(device, hIcon);
-    }
-    if (!icon && !path.empty()) {
-        icon = GetTaskbarIcon(device, path);
-    }
-    if (!icon) {
-        HICON fallback = (HICON)LoadImageW(NULL, reinterpret_cast<LPCWSTR>(ULONG_PTR(32512)), IMAGE_ICON, 0, 0,
-                                           LR_DEFAULTSIZE | LR_SHARED);
-        if (fallback) {
-            icon = TextureLoader::LoadIconFromHandle(device, fallback);
-        }
-    }
-    if (icon) {
-        g_taskbarWindowIconCache[hwnd] = icon;
-    } else if (it != g_taskbarWindowIconCache.end()) {
-        g_taskbarWindowIconCache.erase(it);
-    }
-    return icon;
-}
-
-struct AppCube {
-    DirectX::XMFLOAT3 Position; 
-    DirectX::XMFLOAT4 BaseColor;
-    std::wstring AppPath; 
-    std::string AppName;
-    bool IsHovered;
-    bool IsSelected; 
-    bool WasSelected;
-    ID3D11ShaderResourceView* IconTexture;
-};
 
 // Model debug transform (for imported OBJ)
 DirectX::XMFLOAT3 g_modelPosition = { -2.45f, -2.15f, 9.3f }; // position in world space
@@ -459,32 +123,6 @@ float g_modelRotateAccumDecay = 10.0f;
 bool g_modelLockScreenPos = true;
 bool g_pivotAutoSet = false;
 
-static std::wstring ResolveShortcutTarget(LPCWSTR lnkPath) {
-    std::wstring target;
-    IShellLinkW* shellLink = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink)))) return target;
-    IPersistFile* persistFile = nullptr;
-    if (SUCCEEDED(shellLink->QueryInterface(IID_PPV_ARGS(&persistFile)))) {
-        if (SUCCEEDED(persistFile->Load(lnkPath, STGM_READ))) {
-            shellLink->Resolve(nullptr, SLR_NO_UI | SLR_UPDATE);
-            WCHAR buf[MAX_PATH];
-            if (SUCCEEDED(shellLink->GetPath(buf, MAX_PATH, nullptr, SLGP_RAWPATH))) target = buf;
-        }
-        persistFile->Release();
-    }
-    shellLink->Release();
-    return target;
-}
-
-static std::string WcsToUtf8(const std::wstring& wstr) {
-    if (wstr.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
-    std::string result(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], len, nullptr, nullptr);
-    return result;
-}
-
 static void LaunchAppByPath(LPCWSTR appPath) {
     if (!appPath || appPath[0] == L'\0') return;
     size_t len = wcslen(appPath);
@@ -508,101 +146,6 @@ static void LaunchAppByPath(LPCWSTR appPath) {
         }
     }
 }
-
-static bool SearchMatch(const char* searchFilter, const std::string& label, const std::wstring& path) {
-    if (!searchFilter || searchFilter[0] == '\0') return true;
-    std::string filter(searchFilter);
-    for (auto& c : filter) c = (char)tolower((unsigned char)c);
-    std::string lcLabel = label;
-    for (auto& c : lcLabel) c = (char)tolower((unsigned char)c);
-    if (lcLabel.find(filter) != std::string::npos) return true;
-    std::string lcPath;
-    for (wchar_t ch : path) lcPath += (char)tolower((unsigned char)ch);
-    if (lcPath.find(filter) != std::string::npos) return true;
-    return false;
-}
-
-static void ScanDesktopForApps(std::vector<AppCube>& outApps) {
-    WCHAR desktopPaths[2][MAX_PATH];
-    int pathCount = 0;
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktopPaths[pathCount]))) pathCount++;
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_DESKTOPDIRECTORY, nullptr, 0, desktopPaths[pathCount]))) pathCount++;
-    std::vector<std::wstring> allNames;
-    std::vector<std::pair<std::wstring, std::string>> entries;
-    for (int pi = 0; pi < pathCount; pi++) {
-        std::wstring searchPath = std::wstring(desktopPaths[pi]) + L"\\*.*";
-        WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
-        if (hFind == INVALID_HANDLE_VALUE) { LOGW(L"[desk] FF failed: %s", desktopPaths[pi]); continue; }
-        int found = 0;
-        do {
-            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
-            std::wstring fname(fd.cFileName);
-            std::wstring fullPath = std::wstring(desktopPaths[pi]) + L"\\" + fname;
-            size_t dot = fname.rfind(L'.');
-            std::wstring ext = (dot != std::wstring::npos) ? fname.substr(dot) : L"";
-            std::wstring nameOnly = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
-            std::wstring targetPath;
-            std::string displayName = WcsToUtf8(nameOnly);
-            bool include = false;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (fname == L"." || fname == L"..") continue;
-                targetPath = fullPath; include = true;
-            } else if (_wcsicmp(ext.c_str(), L".lnk") == 0) {
-                targetPath = ResolveShortcutTarget(fullPath.c_str());
-                if (targetPath.empty()) continue;
-                IShellLinkW* sl = nullptr;
-                if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) {
-                    IPersistFile* pf = nullptr;
-                    if (SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf)))) {
-                        if (SUCCEEDED(pf->Load(fullPath.c_str(), STGM_READ))) {
-                            WCHAR desc[256];
-                            if (SUCCEEDED(sl->GetDescription(desc, 256)) && desc[0]) displayName = WcsToUtf8(desc);
-                        }
-                        pf->Release();
-                    }
-                    sl->Release();
-                }
-                include = true;
-            } else if (_wcsicmp(ext.c_str(), L".exe") == 0) {
-                targetPath = fullPath; include = true;
-            } else if (!ext.empty() && _wcsicmp(ext.c_str(), L".ini") != 0 && _wcsicmp(ext.c_str(), L".log") != 0 && _wcsicmp(ext.c_str(), L".tmp") != 0) {
-                targetPath = fullPath; include = true;
-            }
-            if (include) { entries.push_back({ targetPath, displayName }); found++; }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-        LOG("[desk] %ls: %d entries", desktopPaths[pi], found);
-    }
-    const int count = (int)entries.size();
-    if (count == 0) return;
-    const float radius = 8.0f;
-    const DirectX::XMFLOAT3 sphereCenter = { 0.0f, 1.5f, 0.0f };
-    int cols = (int)ceilf(sqrtf((float)count * 1.6f));
-    if (cols < 1) cols = 1;
-    int rows = (count + cols - 1) / cols;
-    const float yawMin = DirectX::XMConvertToRadians(-50.0f);
-    const float yawMax = DirectX::XMConvertToRadians(15.0f);
-    const float pitchMax = DirectX::XMConvertToRadians(30.0f);
-    const float pitchMin = DirectX::XMConvertToRadians(-28.0f);
-    for (int idx = 0; idx < count; ++idx) {
-        int col = idx % cols;
-        int row = idx / cols;
-        float yaw = (cols > 1) ? yawMin + (yawMax - yawMin) * col / (float)(cols - 1) : (yawMin + yawMax) * 0.5f;
-        float pitch = (rows > 1) ? pitchMax + (pitchMin - pitchMax) * row / (float)(rows - 1) : (pitchMax + pitchMin) * 0.5f;
-        float dx = sinf(yaw) * cosf(pitch);
-        float dy = sinf(pitch);
-        float dz = cosf(yaw) * cosf(pitch);
-        AppCube cube = {};
-        cube.Position = DirectX::XMFLOAT3(sphereCenter.x + dx * radius, sphereCenter.y + dy * radius, sphereCenter.z + dz * radius);
-        cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
-        cube.AppPath = entries[idx].first;
-        cube.AppName = entries[idx].second;
-        outApps.push_back(cube);
-    }
-}
-
-std::vector<AppCube> g_myApps;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -841,9 +384,51 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return DefWindowProc(hWnd, msg, wParam, lParam);
         }
+        case WM_RBUTTONDOWN: {
+            g_rightClicked = true;
+            return 0;
+        }
+        case WM_RBUTTONUP: {
+            g_rightClicked = false;
+            return 0;
+        }
         case WM_KEYDOWN:
             if (wParam == VK_CONTROL) g_ctrlHeld = true;
             if (wParam == VK_ESCAPE) PostQuitMessage(0);
+            if (wParam == VK_DELETE) g_deleteRequested = true;
+            if (g_ctrlHeld && (GetKeyState(VK_MENU) & 0x8000)) {
+                RECT workArea;
+                workArea.left = 0;
+                workArea.top = 0;
+                workArea.right = GetSystemMetrics(SM_CXSCREEN);
+                workArea.bottom = g_taskbarRectValid ? g_taskbarRect.top : GetSystemMetrics(SM_CYSCREEN);
+                int snapAction = -1;
+                if (wParam == VK_LEFT)  snapAction = 0;
+                if (wParam == VK_RIGHT) snapAction = 1;
+                if (wParam == VK_UP)    snapAction = 2;
+                if (wParam == VK_DOWN) {
+                    HWND fg = GetForegroundWindow();
+                    for (const auto& w : g_hijackedWindows) {
+                        if (w.hwnd == fg && IsZoomed(fg)) { ShowWindow(fg, SW_RESTORE); snapAction = -1; break; }
+                    }
+                    if (snapAction == -1) return 0;
+                }
+                if (snapAction >= 0) {
+                    HWND fg = GetForegroundWindow();
+                    for (const auto& w : g_hijackedWindows) {
+                        if (w.hwnd == fg) {
+                            RECT r;
+                            if (snapAction == 2) { r = workArea; }
+                            else if (snapAction == 0) { r = workArea; r.right = workArea.left + (workArea.right - workArea.left) / 2; }
+                            else { r = workArea; r.left = workArea.left + (workArea.right - workArea.left) / 2; }
+                            if (IsZoomed(fg)) ShowWindow(fg, SW_RESTORE);
+                            SetWindowPos(fg, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER);
+                            break;
+                        }
+                    }
+                }
+                return 0;
+            }
             return 0;
 
         case WM_KEYUP:
@@ -940,16 +525,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     modelRenderer.LoadModelAsync("assets/bloom_high/bloom_high.obj");
     
     ScanDesktopForApps(g_myApps);
-    for (auto& app : g_myApps) {
-        app.IconTexture = TextureLoader::LoadIconFromExe(g_pd3dDevice, app.AppPath.c_str());
-        if (!app.IconTexture) {
-            SHFILEINFOW sfi = {};
-            if (SHGetFileInfoW(app.AppPath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
-                if (sfi.hIcon) { app.IconTexture = TextureLoader::LoadIconFromHandle(g_pd3dDevice, sfi.hIcon); DestroyIcon(sfi.hIcon); }
-            }
-        }
-        if (!app.IconTexture) LOGW(L"[desk] No icon: %s", app.AppPath.c_str());
-    }
+    LoadDesktopState(g_myApps);
+    LoadIconsForApps(g_myApps);
 
 
     MSG msg; bool done = false;
@@ -1831,6 +1408,54 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             ImGuiViewport* viewport = ImGui::GetMainViewport();
             ImGui::SetNextWindowPos(viewport->WorkPos);
             ImGui::SetNextWindowSize(viewport->WorkSize);
+
+            enum SnapZone {
+                SNAP_NONE = 0,
+                SNAP_LEFT_HALF,
+                SNAP_RIGHT_HALF,
+                SNAP_MAXIMIZE,
+                SNAP_TOP_LEFT,
+                SNAP_TOP_RIGHT,
+                SNAP_BOTTOM_LEFT,
+                SNAP_BOTTOM_RIGHT
+            };
+
+            auto detectSnapZone = [](int mx, int my, const RECT& area) -> SnapZone {
+                const int thresh = 20;
+                bool nearL = (mx - area.left) < thresh;
+                bool nearR = (area.right - mx) < thresh;
+                bool nearT = (my - area.top) < thresh;
+                if (nearT && nearL) return SNAP_TOP_LEFT;
+                if (nearT && nearR) return SNAP_TOP_RIGHT;
+                if (nearT) return SNAP_MAXIMIZE;
+                if (nearL) return SNAP_LEFT_HALF;
+                if (nearR) return SNAP_RIGHT_HALF;
+                return SNAP_NONE;
+            };
+
+            auto getSnapRect = [](SnapZone zone, const RECT& area) -> RECT {
+                RECT r = area;
+                switch (zone) {
+                case SNAP_LEFT_HALF:  r.right = area.left + (area.right - area.left) / 2; break;
+                case SNAP_RIGHT_HALF: r.left  = area.left + (area.right - area.left) / 2; break;
+                case SNAP_MAXIMIZE:   break;
+                case SNAP_TOP_LEFT:   r.right = area.left + (area.right - area.left) / 2;
+                                      r.bottom = area.top + (area.bottom - area.top) / 2; break;
+                case SNAP_TOP_RIGHT:  r.left  = area.left + (area.right - area.left) / 2;
+                                      r.bottom = area.top + (area.bottom - area.top) / 2; break;
+                case SNAP_BOTTOM_LEFT:r.right = area.left + (area.right - area.left) / 2;
+                                      r.top   = area.top + (area.bottom - area.top) / 2; break;
+                case SNAP_BOTTOM_RIGHT:r.left = area.left + (area.right - area.left) / 2;
+                                      r.top  = area.top + (area.bottom - area.top) / 2; break;
+                }
+                return r;
+            };
+
+            RECT workArea;
+            workArea.left = (LONG)viewport->WorkPos.x;
+            workArea.top = (LONG)viewport->WorkPos.y;
+            workArea.right = (LONG)(viewport->WorkPos.x + viewport->WorkSize.x);
+            workArea.bottom = g_taskbarRectValid ? g_taskbarRect.top : (LONG)(viewport->WorkPos.y + viewport->WorkSize.y);
             ImGui::SetNextWindowBgAlpha(0.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -1842,6 +1467,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             ImDrawList* chromeDraw = ImGui::GetWindowDrawList();
             static HWND dragHwnd = nullptr;
             static ImVec2 dragOffset = ImVec2(0.0f, 0.0f);
+            static SnapZone dragSnapZone = SNAP_NONE;
             std::vector<HijackedWindow> alive;
             alive.reserve(g_hijackedWindows.size());
 
@@ -1871,15 +1497,24 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImGui::InvisibleButton("WinDrag", ImVec2(dragWidth, barHeight));
                 if (ImGui::IsItemActivated()) {
                     dragHwnd = win.hwnd;
+                    dragSnapZone = SNAP_NONE;
                     dragOffset = ImVec2(ImGui::GetIO().MousePos.x - barMin.x, ImGui::GetIO().MousePos.y - barMin.y);
                 }
                 if (dragHwnd == win.hwnd && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                     int nx = (int)(ImGui::GetIO().MousePos.x - dragOffset.x);
                     int ny = (int)(ImGui::GetIO().MousePos.y - dragOffset.y);
                     SetWindowPos(win.hwnd, HWND_TOP, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                    dragSnapZone = detectSnapZone((int)ImGui::GetIO().MousePos.x, (int)ImGui::GetIO().MousePos.y, workArea);
                 }
                 if (dragHwnd == win.hwnd && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    if (dragSnapZone != SNAP_NONE) {
+                        RECT snapR = getSnapRect(dragSnapZone, workArea);
+                        SetWindowPos(win.hwnd, HWND_TOP, snapR.left, snapR.top,
+                                     snapR.right - snapR.left, snapR.bottom - snapR.top,
+                                     SWP_NOZORDER);
+                    }
                     dragHwnd = nullptr;
+                    dragSnapZone = SNAP_NONE;
                 }
 
                 float btnY = barMin.y + (barHeight - btnSize) * 0.5f;
@@ -1919,6 +1554,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
                 ImGui::PopID();
                 alive.push_back(win);
+            }
+
+            if (dragHwnd != nullptr && dragSnapZone != SNAP_NONE) {
+                RECT snapR = getSnapRect(dragSnapZone, workArea);
+                ImVec2 p0 = ImVec2((float)snapR.left, (float)snapR.top);
+                ImVec2 p1 = ImVec2((float)snapR.right, (float)snapR.bottom);
+                chromeDraw->AddRectFilled(p0, p1, IM_COL32(0, 140, 255, 60), 6.0f);
+                chromeDraw->AddRect(p0, p1, IM_COL32(0, 160, 255, 180), 6.0f, 0, 2.0f);
             }
 
             g_hijackedWindows.swap(alive);
@@ -2031,6 +1674,18 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 g_modelScale = 10.0f;
                 g_modelMatParams = { 0.5f, 1.0f, 0.0f, 0.1f };
                 g_modelColorTint = { 1.0f, 1.0f, 1.0f, 1.0f };
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Desktop Apps: %d cubes", (int)g_myApps.size());
+            if (ImGui::Button("Reload Desktop Apps")) {
+                for (auto& app : g_myApps) {
+                    if (app.IconTexture) app.IconTexture->Release();
+                }
+                g_myApps.clear();
+                ScanDesktopForApps(g_myApps);
+                LoadDesktopState(g_myApps);
+                LoadIconsForApps(g_myApps);
             }
             ImGui::End();
         }
@@ -2218,6 +1873,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
 
+        if (g_rightClicked && hitAppIndex >= 0) {
+            g_rightClickedCubeIndex = hitAppIndex;
+            g_rightClicked = false;
+        }
+
+        if (g_deleteRequested) {
+            g_deleteRequested = false;
+            for (int i = (int)g_myApps.size() - 1; i >= 0; --i) {
+                if (g_myApps[i].IsSelected) {
+                    if (g_myApps[i].IconTexture) g_myApps[i].IconTexture->Release();
+                    g_myApps.erase(g_myApps.begin() + i);
+                }
+            }
+            SaveDesktopState(g_myApps);
+        }
+
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (g_lButtonHeld)) {
             if (g_grabbedAppIndex != -1) {
                 if (GetTickCount() - g_mouseDownTime > 150) {
@@ -2331,8 +2002,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 }
                 g_dropTargetIndex = -1;
             }
+            bool wasDragging = g_isDragging || g_isBlankDragging;
             g_grabbedAppIndex = -1; g_isDragging = false; g_isBlankDragging = false;
             g_dropTargetIndex = -1;
+            if (wasDragging) SaveDesktopState(g_myApps);
         }
 
         ImDrawList* bg_draw_list = ImGui::GetBackgroundDrawList();
@@ -2452,6 +2125,29 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, camera.Position, canvasScale, anglesFront, nullptr, camera.Position, 5, viewMatrix, 7.6f);
         }
 
+        if (g_rightClickedCubeIndex >= 0 && g_rightClickedCubeIndex < (int)g_myApps.size()) {
+            ImGui::OpenPopup("CubeContextMenu");
+        }
+        if (ImGui::BeginPopup("CubeContextMenu")) {
+            int idx = g_rightClickedCubeIndex;
+            if (idx >= 0 && idx < (int)g_myApps.size()) {
+                ImGui::Text("%s", g_myApps[idx].AppName.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Launch")) {
+                    g_previousUiUnlocked = g_uiUnlocked;
+                    LaunchAppByPath(g_myApps[idx].AppPath.c_str());
+                }
+                if (ImGui::MenuItem("Remove")) {
+                    if (g_myApps[idx].IconTexture) g_myApps[idx].IconTexture->Release();
+                    g_myApps.erase(g_myApps.begin() + idx);
+                    SaveDesktopState(g_myApps);
+                    g_rightClickedCubeIndex = -1;
+                }
+            }
+            ImGui::EndPopup();
+        }
+        g_rightClickedCubeIndex = -1;
+
         g_leftClicked = false;
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -2472,6 +2168,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
     if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
     SetSystemTaskbarVisible(true);
+    SaveDesktopState(g_myApps);
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;

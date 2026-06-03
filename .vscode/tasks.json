@@ -10,6 +10,7 @@
                 "/O2",
                 "/Zi",
                 "/EHsc",
+                "/std:c++17",
                 "/nologo",
                 "/I", "${workspaceFolder}\\vendor\\imgui",
                 "/I", "${workspaceFolder}\\src",

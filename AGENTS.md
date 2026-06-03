@@ -14,34 +14,20 @@
 | Taskbar + 托盘指示器 | 25% | ~55% | ~85% | 无法宿主第三方 tray 图标（`ITrayNotify` 未公开） |
 | 桌面 / 文件图标 / 拖放 | 20% | ~30% | ~80% | 硬编码 14 个 app cube，无文件系统集成 |
 | 文件管理器 | 25% | 0% | ~75% | 完全未开始 |
-| 窗口管理 + Alt+Tab | 15% | ~20% | ~80% | 能劫持但无吸附/切换/虚拟桌面 |
+| 窗口管理 + Alt+Tab | 15% | ~35% | ~80% | 能劫持，有边缘吸附和快捷键，缺 Alt+Tab 替换/虚拟桌面 |
 | Start Menu | 5% | ~40% | ~70% | 搜索框是摆设，无动态应用列表 |
 | 通知中心 | 7% | 0% | ~25% | WinRT 通知管道受保护，只能做自建覆盖层 |
 | 系统工具区 | 3% | ~60% | ~80% | 自绘电池/音量/网络/IME，形态已稳定 |
 
-**当前加权覆盖度：~18% / 公开 API 理论上限：~76% / Explorer 降格架构理论上限：~95%**
+**当前加权覆盖度：~22% / 公开 API 理论上限：~76% / Explorer 降格架构理论上限：~95%**
 
 ## Tech Stack
-- **Language:** C++17/20 (MSVC `cl.exe`, `/O2`)
-- **Graphics:** DirectX 11
-- **UI:** Dear ImGui (Docking branch in `vendor/imgui/`)
-- **Math:** DirectXMath, DirectXCollision
-- **System:** Win32 API, DWM API, COM (IAudioEndpointVolume, IMM32, Iphlpapi)
-- **No external deps** — no Assimp, no Boost, no CMake, no .sln
-
-## Build & Run
-- **Prerequisite:** Visual Studio 2022 Build Tools with C++ desktop workload.
-  Compiler path set in `.vscode/settings.json` — update if your MSVC version differs.
-- **Build:** `Ctrl+Shift+B` in VS Code (runs `tasks.json`).
-- **Output:** `build\CrossDim.exe`
-- **Must run as Administrator** — required for hijacking high-privilege windows (Task Manager, etc.).
-- **Include paths:** `vendor/imgui`, `src`
-- **Linker libs** (via `#pragma comment(lib)` in `main.cpp`): `d3d11.lib`, `user32.lib`, `ole32.lib`, `imm32.lib`, `iphlpapi.lib`, `dwmapi.lib`, `d3dcompiler.lib`
+- **Language:** C++17/20 (MSVC `cl.exe`, `/O2`, `/std:c++17`)
 
 ### Compiled source files (`tasks.json` explicit file list)
 | File | Lines | Notes |
 |---|---|---|
-| `src/main.cpp` | 2474 | Entry point. `wWinMain`, state machine, taskbar, window hijacking, raycasting, drag-drop, search, spherical layout |
+| `src/main.cpp` | 2126 | Entry point. `wWinMain`, state machine, taskbar UI, window chrome, raycasting, drag-drop, model debug |
 | `src/Engine/Camera.cpp` | 69 | FPS-style camera (rotation only, `Move()` exists but never called) |
 | `src/Engine/SkyboxRenderer.cpp` | 147 | Procedural skybox |
 | `src/Engine/CubeRenderer.cpp` | 251 | 3D icon cubes + spherical sector selection |
@@ -51,12 +37,13 @@
 | `vendor/imgui/backends/imgui_impl_win32.cpp` | — | Win32 backend |
 | `vendor/imgui/backends/imgui_impl_dx11.cpp` | — | DX11 backend |
 
-### Source files NOT in the build
-- `src/Engine/Logger.h` (77 lines) — header-only singleton, included by `main.cpp`.
-- `src/Engine/TrayProxy.h` (75 lines) — header-only tray icon query helper, included by `main.cpp`.
-- `src/Engine/TextureLoader.h` (212 lines) — header-only texture/icon utilities, included by `main.cpp`.
-
-No tests exist. No lint/formatter config at project root.
+### Header-only modules (included by `main.cpp`, not compiled separately)
+- `src/Engine/Logger.h` (129 lines) — header-only singleton, `logs/` dir, auto-prune old logs.
+- `src/Engine/TrayProxy.h` (75 lines) — header-only tray icon query helper.
+- `src/Engine/TextureLoader.h` (212 lines) — header-only texture/icon utilities.
+- `src/Shell/DesktopManager.h` (224 lines) — `AppCube`, desktop scan, persistence, search.
+- `src/Shell/WindowManager.h` (235 lines) — window enumeration, hijack queue, icon cache.
+- `src/Shell/SystemInfo.h` (122 lines) — audio, IME, network status.
 
 ## Architecture
 
@@ -141,30 +128,30 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | 5 | `ModelRenderer` destructor doesn't detach async load thread | Fixed — join thread in `Cleanup()` |
 | 6 | `ModelRenderer::LoadModel()` dead declaration | Fixed — removed declaration |
 | 7 | `m_pendingNormalPathW` never populated | Fixed — parse `map_Bump`/`bump` from MTL; keep fallback on load failure |
-| 8 | `desktop.cddesk` no read/write code | Resolved — `ScanDesktopForApps` handles desktop scanning |
+| 8 | `desktop.cddesk` no read/write code | Resolved — binary save/load implemented, positions persist across sessions |
 
 ## Feature Roadmap
 
 ### Phase 1 — Stability & Foundation (~620 lines, Debug: Med-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | Skipped (dev phase) |
-| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | Deferred (2.5k lines acceptable) |
+| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | Partial — cube positions save/load via desktop.cddesk ✅. Pinned apps/preferences not persisted |
+| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | ✅ — split into `src/Shell/DesktopManager.h` (224L) / `WindowManager.h` (235L) / `SystemInfo.h` (122L). main.cpp 2612→2126 lines |
 | 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None | ✅ |
 | 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None | ✅ |
 
 ### Phase 2 — Desktop Completeness (~880 lines, Debug: Medium)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | — |
-| 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 | — |
+| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | Partial — save/load, Delete key removal, right-click context menu ✅. File picker/Start Menu scan still TODO |
+| 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 | ✅ |
 | 2.3 | Camera movement (WASD + scroll zoom, `Camera::Move()` already implemented) | ~100 | Low | None | Removed (excluded from design) |
 | 2.4 | Search engine (hook existing Start Menu search box, substring filter on apps/cubes) | ~160 | Low-Med | 2.1 | ✅ |
 
 ### Phase 3 — Window Management (~740 lines, Debug: Med-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 | — |
+| 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 | ✅ — drag-to-edge half/maximize/quarter, blue preview overlay, Ctrl+Alt+Arrows shortcuts |
 | 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | — |
 | 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | — |
 
@@ -173,7 +160,7 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 |---|---|---|---|---|---|
 | 4.1 | Enable BloomRenderer (add to tasks.json, integration call) | ~35 | Low | None | Removed (abandoned) |
 | 4.2 | MTL parser: normal map (`map_Bump`) support, optional PBR shader upgrade | ~140 | Low-Med | None | ✅ |
-| 4.3 | Dynamic system tray (enumerate background processes, replace hardcoded items) | ~90 | Low | None | — |
+| 4.3 | Dynamic system tray (enumerate background processes, replace hardcoded items) | ~90 | Low | None | ✅ |
 | 4.4 | Shader hot-reload (file watcher thread + D3D pipeline recompile) | ~180 | **High** | None | — |
 
 ### Phase 5 — Safety Nets & Shell Transition
@@ -193,6 +180,29 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | 6.3 | Multi-monitor support (per-monitor viewport + taskbar) | ~210 | **High** |
 | 6.4 | Accessibility (high contrast, UIA text exposure) | ~100 | Medium |
 | 6.5 | File manager module (shell namespace browsing, copy/paste/delete, properties panel) | ~3000-5000 | **Very High** |
+
+## Commit Message Convention
+All commits MUST follow this format:
+
+```
+<type>: <brief description> v<version>
+
+<type>   — one of: feat, fix, refactor, chore, docs
+<brief>  — concise summary, Chinese or English, max 60 chars
+<version>— semantic version tag (vMAJOR.MINOR.PATCH)
+```
+
+**Examples:**
+```
+feat: cube position persistence + right-click context menu v0.0.7
+fix: fix g_leftClicked double-reset issue v0.0.6
+refactor: split main.cpp into Shell modules v0.0.7
+chore: unify logs to logs/ dir + auto-prune v0.0.7
+```
+
+- **Tags** are lightweight: `git tag v0.0.7`
+- **Version bumps**: PATCH for fixes/refactors, MINOR for new features, MAJOR for shell-mode switch
+- **Multi-commit versions**: append `-rc1`, `-rc2` etc. before the final tag
 
 ## Strict Rules
 ### 1. Never block the main thread
