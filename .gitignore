@@ -4,9 +4,16 @@ build/
 *.obj
 *.pdb
 *.ilk
+*.sdf
+*.suo
+*.user
 imgui.ini
 *.cdmesh
 desktop.cddesk
 logs/
 assets/bloom_high/*.obj
+
+# OS
+Thumbs.db
+.DS_Store
 

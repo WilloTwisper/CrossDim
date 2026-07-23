@@ -70,4 +70,4 @@ vendor/
 
 ## License
 
-Source code TBD. Dear ImGui included under MIT license.
+MIT. See [LICENSE](LICENSE). Dear ImGui included under MIT license.
