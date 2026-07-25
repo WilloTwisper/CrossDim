@@ -10,6 +10,7 @@ build/
 imgui.ini
 *.cdmesh
 desktop.cddesk
+desktop_*.cddesk
 logs/
 assets/bloom_high/*.obj
 

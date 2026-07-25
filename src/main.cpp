@@ -73,6 +73,8 @@ HANDLE g_hShutdownEvent = nullptr;
 
 float g_mouseDeltaX = 0.0f;
 float g_mouseDeltaY = 0.0f;
+float g_folderCamDX = 0.0f;
+float g_folderCamDY = 0.0f;
 
 bool g_leftClicked = false;
 bool g_ctrlHeld = false;
@@ -88,6 +90,7 @@ int   g_dropTargetIndex = -1;
 int   g_rightClickedCubeIndex = -1;
 bool  g_rightClicked = false;
 bool  g_deleteRequested = false;
+bool  g_exitFolderRequested = false;
 
 bool  g_isBlankDragging = false;
 float g_dragStartYaw = 0.0f;
@@ -99,6 +102,288 @@ float g_dragPrevRawYaw = 0.0f;
 float g_fpsCurrent = 0.0f;
 char g_searchFilter[64] = "";
 float g_dragDistance = 8.0f;
+
+// Virtual desktop state
+static int g_activeDesktopIndex = 0;
+static std::vector<int> g_desktopSlots;
+static int g_nextDesktopId = 1;
+static int g_targetDesktopIndex = -1;
+static float g_desktopTransition = 0.0f;
+static const float g_desktopTransitionSpeed = 4.0f;
+static bool g_showDesktopOverview = false;
+static std::vector<std::vector<HijackedWindow>> g_desktopWindows;
+
+static int GetDesktopSlotCount() { return (int)g_desktopSlots.size(); }
+
+static void SwitchToDesktop(int slotIdx) {
+    if (slotIdx == g_activeDesktopIndex || slotIdx < 0 || slotIdx >= (int)g_desktopSlots.size()) return;
+    if (g_targetDesktopIndex >= 0) return;
+    SaveDesktopState(g_myApps, g_activeDesktopIndex);
+    // Hide all windows on current desktop
+    for (const auto& w : g_hijackedWindows) {
+        ShowWindow(w.hwnd, SW_HIDE);
+    }
+    g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
+    g_targetDesktopIndex = slotIdx;
+    g_desktopTransition = 0.0f;
+}
+
+static void CompleteDesktopSwitch() {
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps.clear();
+    g_hijackedWindows = g_desktopWindows[g_targetDesktopIndex];
+    // Show all windows on new desktop
+    for (const auto& w : g_hijackedWindows) {
+        if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
+    }
+    ScanDesktopForApps(g_myApps);
+    LoadDesktopState(g_myApps, g_targetDesktopIndex);
+    LoadIconsForApps(g_myApps);
+    g_activeDesktopIndex = g_targetDesktopIndex;
+    g_targetDesktopIndex = -1;
+    g_desktopTransition = 1.0f;
+}
+
+static void CreateNewDesktop() {
+    int newId = g_nextDesktopId++;
+    g_desktopSlots.push_back(newId);
+    SaveDesktopState(g_myApps, g_activeDesktopIndex);
+    // Hide current desktop's windows and save to cache
+    for (const auto& w : g_hijackedWindows) {
+        ShowWindow(w.hwnd, SW_HIDE);
+    }
+    g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
+    g_activeDesktopIndex = (int)g_desktopSlots.size() - 1;
+    g_hijackedWindows.clear();
+    // Initialize new desktop's window cache
+    g_desktopWindows.push_back({});
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps.clear();
+    ScanDesktopForApps(g_myApps);
+    LoadDesktopState(g_myApps, g_activeDesktopIndex);
+    LoadIconsForApps(g_myApps);
+}
+
+static void CloseDesktop(int slotIdx) {
+    if (g_desktopSlots.size() <= 1) return;
+    if (g_targetDesktopIndex >= 0) return;
+    int closingId = g_desktopSlots[slotIdx];
+    wchar_t fname[64];
+    swprintf_s(fname, L"desktop_%d.cddesk", closingId);
+    DeleteFileW(fname);
+    int removeSlot = slotIdx;
+    if (slotIdx == g_activeDesktopIndex) {
+        for (auto& app : g_myApps) {
+            if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+        }
+        g_myApps.clear();
+        int fallback = (slotIdx > 0) ? slotIdx - 1 : 1;
+        // Hide closing desktop windows, show fallback desktop windows
+        for (const auto& w : g_hijackedWindows) {
+            ShowWindow(w.hwnd, SW_MINIMIZE);
+        }
+        g_desktopWindows[slotIdx] = g_hijackedWindows;
+        g_desktopSlots.erase(g_desktopSlots.begin() + removeSlot);
+        g_desktopWindows.erase(g_desktopWindows.begin() + removeSlot);
+        if (g_activeDesktopIndex >= (int)g_desktopSlots.size())
+            g_activeDesktopIndex = (int)g_desktopSlots.size() - 1;
+        g_hijackedWindows = g_desktopWindows[g_activeDesktopIndex];
+        for (const auto& w : g_hijackedWindows) {
+            if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
+        }
+        ScanDesktopForApps(g_myApps);
+        LoadDesktopState(g_myApps, g_activeDesktopIndex);
+        LoadIconsForApps(g_myApps);
+    } else {
+        g_desktopSlots.erase(g_desktopSlots.begin() + removeSlot);
+        g_desktopWindows.erase(g_desktopWindows.begin() + removeSlot);
+        if (g_activeDesktopIndex > slotIdx) g_activeDesktopIndex--;
+    }
+}
+
+// Spatial folder navigation
+struct FolderState {
+    std::wstring folderPath;
+    std::string displayName;
+    std::vector<AppCube> cubes;
+    DirectX::XMFLOAT3 cameraPos;
+    DirectX::XMFLOAT3 cameraRot;
+};
+static std::vector<FolderState> g_folderStack;
+static bool g_isInFolder = false;
+static bool g_isFolderMaximized = true;
+static RECT g_folderWindowRect = { 100, 80, 1300, 850 };
+static std::vector<AppCube> g_folderCubes;
+static Camera g_folderCamera;
+static bool g_isDraggingFolderWin = false;
+static ImVec2 g_folderDragOff;
+static bool g_folderMouseLocked = false;
+static float g_folderTransitionT = 0.0f;
+static DirectX::XMFLOAT3 g_folderFromPos, g_folderToPos;
+static DirectX::XMFLOAT3 g_folderFromRot, g_folderToRot;
+static std::vector<AppCube> g_desktopBackupCubes;
+static DirectX::XMFLOAT3 g_desktopBackupCamPos, g_desktopBackupCamRot;
+
+static bool IsPathDirectory(const std::wstring& path) {
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+static void EnterFolder(const std::wstring& path, Camera& camera) {
+    if (g_folderStack.empty()) {
+        g_desktopBackupCubes = g_myApps;
+        for (auto& c : g_desktopBackupCubes) c.IconTexture = nullptr;
+        g_desktopBackupCamPos = camera.Position;
+        g_desktopBackupCamRot = camera.Rotation;
+    } else {
+        // Save current folder state to its stack entry before entering subfolder
+        if (g_isFolderMaximized)
+            g_folderStack.back().cubes = g_myApps;
+        else
+            g_folderStack.back().cubes = g_folderCubes;
+        for (auto& c : g_folderStack.back().cubes) c.IconTexture = nullptr;
+    }
+
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    for (auto& app : g_folderCubes) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps.clear();
+    g_folderCubes.clear();
+
+    std::vector<AppCube> newCubes;
+    ScanFolderForApps(path, newCubes);
+    LoadIconsForApps(newCubes);
+
+    FolderState fs;
+    std::wstring fn = path; size_t sl = fn.rfind(L'\\');
+    if (sl != std::wstring::npos) fn = fn.substr(sl + 1);
+    for (wchar_t ch : fn) fs.displayName += (char)ch;
+    fs.folderPath = path;
+    fs.cubes = newCubes;
+    for (auto& c : fs.cubes) c.IconTexture = nullptr;
+    g_folderStack.push_back(fs);
+    g_isInFolder = true;
+    g_isFolderMaximized = false;
+
+    g_folderCubes = newCubes;
+    LoadIconsForApps(g_folderCubes);
+    g_myApps = g_desktopBackupCubes;
+    LoadIconsForApps(g_myApps);
+    DirectX::XMFLOAT3 center = { 0.0f, 1.5f, 0.0f };
+    g_folderCamera.Position = { center.x, center.y, center.z - 5.0f };
+    g_folderCamera.Rotation = { 0.0f, 0.0f, 0.0f };
+    // Lock cursor to portal center
+    LONG cx = (g_folderWindowRect.left + g_folderWindowRect.right) / 2;
+    LONG cy = (g_folderWindowRect.top + g_folderWindowRect.bottom) / 2;
+    SetCursorPos(cx, cy);
+}
+
+static void ExitFolderToParent(Camera& camera) {
+    if (g_folderStack.empty()) return;
+    // Release portal icons
+    for (auto& app : g_folderCubes) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_folderCubes.clear();
+    // Release desktop icons (for reload)
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_folderStack.pop_back();
+    if (g_folderStack.empty()) {
+        // Back to desktop
+        g_myApps = g_desktopBackupCubes;
+        LoadIconsForApps(g_myApps);
+        g_isInFolder = false;
+        g_isFolderMaximized = true;
+        camera.Position = g_desktopBackupCamPos;
+        camera.Rotation = g_desktopBackupCamRot;
+    } else {
+        // Back to parent folder: restore desktop, rescan parent for portal
+        g_myApps = g_desktopBackupCubes;
+        LoadIconsForApps(g_myApps);
+        // Rescan parent folder for portal cubes
+        std::vector<AppCube> pcubes;
+        ScanFolderForApps(g_folderStack.back().folderPath, pcubes);
+        LoadIconsForApps(pcubes);
+        g_folderCubes = pcubes;
+        g_folderStack.back().cubes = pcubes;
+        for (auto& c : g_folderStack.back().cubes) c.IconTexture = nullptr;
+    }
+}
+
+static void ExitFolderToRoot(Camera& camera) {
+    if (!g_isInFolder) return;
+    for (auto& app : g_folderCubes) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_folderCubes.clear();
+    g_folderStack.clear();
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps = g_desktopBackupCubes;
+    LoadIconsForApps(g_myApps);
+    g_isInFolder = false;
+    g_isFolderMaximized = true;
+    camera.Position = g_desktopBackupCamPos;
+    camera.Rotation = g_desktopBackupCamRot;
+}
+
+static void MakeFolderWindowed(Camera& mainCam) {
+    if (!g_isInFolder || !g_isFolderMaximized) return;
+    // Save maximized folder cubes to stack
+    if (!g_folderStack.empty()) {
+        g_folderStack.back().cubes = g_myApps;
+        for (auto& c : g_folderStack.back().cubes) c.IconTexture = nullptr;
+    }
+    // Set up portal — copy then null before release to avoid dangling pointers
+    g_folderCubes = g_myApps;
+    for (auto& c : g_folderCubes) c.IconTexture = nullptr;
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps.clear();
+    g_myApps = g_desktopBackupCubes;
+    LoadIconsForApps(g_myApps);
+    LoadIconsForApps(g_folderCubes);
+    g_isFolderMaximized = false;
+    DirectX::XMFLOAT3 center = { 0.0f, 1.5f, 0.0f };
+    g_folderCamera.Position = { center.x, center.y, center.z - 5.0f };
+    g_folderCamera.Rotation = { 0.0f, 0.0f, 0.0f };
+}
+
+static void MakeFolderMaximized(Camera& mainCam) {
+    if (!g_isInFolder || g_isFolderMaximized) return;
+    // Save desktop state (in case user modified it)
+    g_desktopBackupCubes = g_myApps;
+    for (auto& c : g_desktopBackupCubes) c.IconTexture = nullptr;
+    g_desktopBackupCamPos = mainCam.Position;
+    g_desktopBackupCamRot = mainCam.Rotation;
+    // Release desktop icons
+    for (auto& app : g_myApps) {
+        if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+    }
+    g_myApps.clear();
+    // Move portal cubes to g_myApps for fullscreen mode
+    g_myApps = g_folderCubes;
+    LoadIconsForApps(g_myApps);
+    g_folderCubes.clear();
+    g_isFolderMaximized = true;
+    DirectX::XMFLOAT3 center = { 0.0f, 1.5f, 0.0f };
+    g_folderFromPos = mainCam.Position;
+    g_folderFromRot = mainCam.Rotation;
+    g_folderToPos = { center.x, center.y, center.z - 6.0f };
+    g_folderToRot = { 0.0f, 0.0f, 0.0f };
+    g_folderTransitionT = 0.0f;
+}
 
 // Model debug transform (for imported OBJ)
 DirectX::XMFLOAT3 g_modelPosition = { -2.45f, -2.15f, 9.3f }; // position in world space
@@ -248,6 +533,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         LOG("=== End Dump ===");
         return 0;
     }
+    if (msg == WM_HOTKEY && wParam == 4) {
+        if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
+            toggleUiUnlock(hWnd);
+        }
+        g_showDesktopOverview = !g_showDesktopOverview;
+        return 0;
+    }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
         toggleUiUnlock(hWnd);
         return 0;
@@ -374,7 +666,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                 RAWINPUT raw;
                 UINT dwSize = sizeof(RAWINPUT);
-                
                 if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &dwSize, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
                     if (raw.header.dwType == RIM_TYPEMOUSE) {
                         g_mouseDeltaX += (float)raw.data.mouse.lLastX;
@@ -395,8 +686,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KEYDOWN:
             if (wParam == VK_CONTROL) g_ctrlHeld = true;
             if (wParam == VK_ESCAPE) PostQuitMessage(0);
-            if (wParam == VK_DELETE) g_deleteRequested = true;
             if (g_ctrlHeld && (GetKeyState(VK_MENU) & 0x8000)) {
+                int slotCount = GetDesktopSlotCount();
+                if (wParam >= '1' && wParam <= '0' + slotCount) {
+                    SwitchToDesktop((int)(wParam - '1'));
+                    return 0;
+                }
                 RECT workArea;
                 workArea.left = 0;
                 workArea.top = 0;
@@ -462,6 +757,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
     RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_ESCAPE);
     RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'D');
+    RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
     Logger::Instance().Init();
     SetSystemTaskbarVisible(false);
     DragAcceptFiles(hwnd, TRUE);
@@ -527,6 +823,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     ScanDesktopForApps(g_myApps);
     LoadDesktopState(g_myApps);
     LoadIconsForApps(g_myApps);
+    g_desktopSlots = { 0 };
+    g_desktopWindows = { {} };
+    g_activeDesktopIndex = 0;
 
 
     MSG msg; bool done = false;
@@ -605,6 +904,23 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         float modelScaleComp = (sceneTan > 0.0001f && modelTan > 0.0001f) ? (modelTan / sceneTan) : 1.0f;
 
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
+            if (g_folderTransitionT > 0.0f && g_folderTransitionT < 1.0f) {
+                float t = g_folderTransitionT;
+                float ease = t * t * (3.0f - 2.0f * t); // smoothstep
+                camera.Position.x = g_folderFromPos.x + (g_folderToPos.x - g_folderFromPos.x) * ease;
+                camera.Position.y = g_folderFromPos.y + (g_folderToPos.y - g_folderFromPos.y) * ease;
+                camera.Position.z = g_folderFromPos.z + (g_folderToPos.z - g_folderFromPos.z) * ease;
+                camera.Rotation.x = g_folderFromRot.x + (g_folderToRot.x - g_folderFromRot.x) * ease;
+                camera.Rotation.y = g_folderFromRot.y + (g_folderToRot.y - g_folderFromRot.y) * ease;
+                camera.Rotation.z = g_folderFromRot.z + (g_folderToRot.z - g_folderFromRot.z) * ease;
+                g_mouseDeltaX = 0.0f; g_mouseDeltaY = 0.0f;
+                g_folderTransitionT += dt * 3.5f;
+                if (g_folderTransitionT >= 1.0f) {
+                    camera.Position = g_folderToPos;
+                    camera.Rotation = g_folderToRot;
+                    g_folderTransitionT = 1.0f;
+                }
+            }
             
             if (g_mouseDeltaX != 0.0f || g_mouseDeltaY != 0.0f) {
                 camera.Rotate(g_mouseDeltaX, g_mouseDeltaY, 0.15f);
@@ -663,6 +979,89 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+
+        // Folder breadcrumb top bar (maximized mode only)
+        if (g_isInFolder && g_isFolderMaximized) {
+            ImGuiViewport* vp = ImGui::GetMainViewport();
+            float barH = 38.0f;
+            ImVec2 barPos = ImVec2(vp->WorkPos.x, vp->WorkPos.y);
+            ImVec2 barSize = ImVec2(vp->WorkSize.x, barH);
+            ImGui::SetNextWindowPos(barPos);
+            ImGui::SetNextWindowSize(barSize);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
+            ImGui::Begin("##FolderBar", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImDrawList* fbDraw = ImGui::GetWindowDrawList();
+            ImVec2 fbP0 = ImGui::GetWindowPos();
+            ImVec2 fbP1 = ImVec2(fbP0.x + barSize.x, fbP0.y + barH);
+            fbDraw->AddRectFilled(fbP0, fbP1, IM_COL32(32, 36, 50, 235));
+            fbDraw->AddRectFilled(fbP0, fbP1, IM_COL32(50, 60, 85, 60));
+            fbDraw->AddLine(ImVec2(fbP0.x, fbP1.y - 1.0f), ImVec2(fbP1.x, fbP1.y - 1.0f), IM_COL32(255, 255, 255, 15), 1.0f);
+
+            // Breadcrumb segments
+            float bx = fbP0.x + 10.0f, by = fbP0.y + (barH - 20.0f) * 0.5f;
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(180, 190, 200, 220));
+            if (ImGui::SmallButton("Desktop")) {
+                if (g_isInFolder) ExitFolderToRoot(camera);
+            }
+            ImGui::SameLine();
+            for (int i = 0; i < (int)g_folderStack.size(); ++i) {
+                ImGui::Text(">");
+                ImGui::SameLine();
+                char segId[64];
+                sprintf_s(segId, "##BC%d", i);
+                ImGui::PushID(i);
+                if (ImGui::SmallButton(g_folderStack[i].displayName.c_str())) {
+                    while ((int)g_folderStack.size() > i + 1)
+                        ExitFolderToParent(camera);
+                }
+                ImGui::PopID();
+                ImGui::SameLine();
+            }
+            ImGui::PopStyleColor();
+
+            // Window chrome buttons (right side)
+            float btnSize = 14.0f, btnGap = 8.0f, btnPad = 12.0f;
+            float btnY = fbP0.y + (barH - btnSize) * 0.5f;
+            float cx = fbP1.x - btnPad - btnSize;
+
+            // Close button
+            ImGui::SetCursorScreenPos(ImVec2(cx, btnY));
+            ImGui::InvisibleButton("FBClose", ImVec2(btnSize, btnSize));
+            bool clH = ImGui::IsItemHovered();
+            fbDraw->AddCircleFilled(ImVec2(cx + btnSize * 0.5f, btnY + btnSize * 0.5f), btnSize * 0.48f,
+                                    clH ? IM_COL32(255, 95, 95, 230) : IM_COL32(255, 120, 120, 200));
+            if (ImGui::IsItemClicked()) ExitFolderToRoot(camera);
+
+            // Minimize button (windowed mode)
+            cx -= btnGap + btnSize;
+            ImGui::SetCursorScreenPos(ImVec2(cx, btnY));
+            ImGui::InvisibleButton("FBMin", ImVec2(btnSize, btnSize));
+            bool fMinH = ImGui::IsItemHovered();
+            fbDraw->AddRectFilled(ImVec2(cx + 3.0f, btnY + btnSize * 0.5f), ImVec2(cx + btnSize - 3.0f, btnY + btnSize * 0.5f + 2.0f),
+                                  fMinH ? IM_COL32(110, 220, 140, 230) : IM_COL32(140, 235, 165, 200), 1.5f);
+            if (ImGui::IsItemClicked() && g_isFolderMaximized) MakeFolderWindowed(camera);
+
+            // Maximize button
+            cx -= btnGap + btnSize;
+            ImGui::SetCursorScreenPos(ImVec2(cx, btnY));
+            ImGui::InvisibleButton("FBMax", ImVec2(btnSize, btnSize));
+            fbDraw->AddRectFilled(ImVec2(cx + 2.0f, btnY + 2.0f), ImVec2(cx + btnSize - 2.0f, btnY + btnSize - 2.0f),
+                                  ImGui::IsItemHovered() ? IM_COL32(255, 210, 90, 230) : IM_COL32(255, 225, 140, 200), 3.0f);
+            if (ImGui::IsItemClicked()) {
+                if (g_isFolderMaximized) MakeFolderWindowed(camera);
+                else MakeFolderMaximized(camera);
+            }
+
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+        }
+
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
             ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
             ImVec2 center = ImVec2(ImGui::GetMainViewport()->WorkPos.x + ImGui::GetMainViewport()->WorkSize.x * 0.5f,
@@ -1140,6 +1539,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 dragMouseStart = ImVec2(0, 0);
             }
 
+            // Task View toggle button
+            {
+                float tvSize = 22.0f;
+                ImGui::SetCursorScreenPos(ImVec2(p1.x - paddingX - rightAreaWidth - tvSize - trayGap, p0.y + (barHeight - tvSize) * 0.5f));
+                ImGui::InvisibleButton("TaskView", ImVec2(tvSize, tvSize));
+                ImU32 tvColor = ImGui::IsItemHovered() ? IM_COL32(0, 140, 255, 180) : g_showDesktopOverview ? IM_COL32(0, 140, 255, 120) : IM_COL32(40, 50, 70, 50);
+                ImVec2 tvCenter = ImVec2(ImGui::GetItemRectMin().x + tvSize * 0.5f, ImGui::GetItemRectMin().y + tvSize * 0.5f);
+                draw->AddRectFilled(ImVec2(tvCenter.x - tvSize * 0.5f, tvCenter.y - tvSize * 0.5f), ImVec2(tvCenter.x + tvSize * 0.5f, tvCenter.y + tvSize * 0.5f), tvColor, 4.0f);
+                // Draw two overlapping rectangles to suggest "multi desktop"
+                draw->AddRect(ImVec2(tvCenter.x - 6.0f, tvCenter.y - 5.0f), ImVec2(tvCenter.x + 2.0f, tvCenter.y + 5.0f), IM_COL32(200, 210, 220, 220), 3.0f, 0, 1.2f);
+                draw->AddRect(ImVec2(tvCenter.x - 2.0f, tvCenter.y - 3.0f), ImVec2(tvCenter.x + 6.0f, tvCenter.y + 7.0f), IM_COL32(160, 180, 200, 200), 3.0f, 0, 1.2f);
+                if (ImGui::IsItemClicked()) {
+                    g_showDesktopOverview = !g_showDesktopOverview;
+                }
+            }
+
             ImU32 trayColor = IM_COL32(20, 30, 50, 220);
             ImU32 trayMuted = IM_COL32(20, 30, 50, 150);
             ImU32 netColor = netConnected ? trayColor : IM_COL32(20, 30, 50, 110);
@@ -1499,6 +1914,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     dragHwnd = win.hwnd;
                     dragSnapZone = SNAP_NONE;
                     dragOffset = ImVec2(ImGui::GetIO().MousePos.x - barMin.x, ImGui::GetIO().MousePos.y - barMin.y);
+                    LONG style = GetWindowLong(win.hwnd, GWL_STYLE);
+                    if (style & WS_THICKFRAME) {
+                        SetWindowLong(win.hwnd, GWL_STYLE, style & ~WS_THICKFRAME);
+                        SetWindowPos(win.hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                    }
                 }
                 if (dragHwnd == win.hwnd && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                     int nx = (int)(ImGui::GetIO().MousePos.x - dragOffset.x);
@@ -1512,6 +1932,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                         SetWindowPos(win.hwnd, HWND_TOP, snapR.left, snapR.top,
                                      snapR.right - snapR.left, snapR.bottom - snapR.top,
                                      SWP_NOZORDER);
+                    }
+                    LONG style = GetWindowLong(win.hwnd, GWL_STYLE);
+                    if (!(style & WS_THICKFRAME)) {
+                        SetWindowLong(win.hwnd, GWL_STYLE, style | WS_THICKFRAME);
+                        SetWindowPos(win.hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
                     }
                     dragHwnd = nullptr;
                     dragSnapZone = SNAP_NONE;
@@ -1567,6 +1992,239 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             g_hijackedWindows.swap(alive);
             ImGui::End();
             ImGui::PopStyleVar(3);
+        }
+
+        // Folder window chrome (windowed mode)
+        if (g_isInFolder && !g_isFolderMaximized) {
+            RECT& wr = g_folderWindowRect;
+            float fbarH = 30.0f, fbtnS = 14.0f, fbtnG = 8.0f, fbtnP = 10.0f;
+            ImVec2 fbarMin = ImVec2((float)wr.left, (float)wr.top);
+            ImVec2 fbarMax = ImVec2((float)wr.right, (float)wr.top + fbarH);
+            float fctrlW = fbtnS * 3.0f + fbtnG * 2.0f;
+            float fdragW = (fbarMax.x - fbarMin.x) - (fctrlW + fbtnP * 2.0f);
+            if (fdragW < 20.0f) fdragW = 20.0f;
+            ImDrawList* fDraw = ImGui::GetForegroundDrawList();
+            // Title bar background
+            fDraw->AddRectFilled(fbarMin, fbarMax, IM_COL32(32, 36, 50, 240), 6.0f);
+            fDraw->AddRect(fbarMin, fbarMax, IM_COL32(80, 90, 120, 120), 6.0f);
+            // Breadcrumb title
+            std::string fTitle;
+            for (int i = 0; i < (int)g_folderStack.size(); ++i) {
+                if (i > 0) fTitle += " > ";
+                fTitle += g_folderStack[i].displayName;
+            }
+            if (fTitle.empty()) fTitle = "Folder";
+            fDraw->AddText(ImVec2(fbarMin.x + 10.0f, fbarMin.y + 8.0f), IM_COL32(200, 210, 220, 230), fTitle.c_str());
+
+            // Drag area
+            ImGui::SetCursorScreenPos(fbarMin);
+            ImGui::PushID("FolderWin");
+            ImGui::InvisibleButton("FWDrag", ImVec2(fdragW, fbarH));
+            if (ImGui::IsItemActivated()) {
+                g_isDraggingFolderWin = true;
+                g_folderDragOff = ImVec2(ImGui::GetIO().MousePos.x - fbarMin.x, ImGui::GetIO().MousePos.y - fbarMin.y);
+            }
+            if (g_isDraggingFolderWin && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                float nx = ImGui::GetIO().MousePos.x - g_folderDragOff.x;
+                float ny = ImGui::GetIO().MousePos.y - g_folderDragOff.y;
+                float ww = (float)(wr.right - wr.left), wh = (float)(wr.bottom - wr.top);
+                wr.left = (LONG)nx; wr.top = (LONG)ny; wr.right = (LONG)(nx + ww); wr.bottom = (LONG)(ny + wh);
+            }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) g_isDraggingFolderWin = false;
+
+            // Chrome buttons
+            float fbtnY = fbarMin.y + (fbarH - fbtnS) * 0.5f;
+            float fcx = fbarMax.x - fbtnP - fbtnS;
+            // Close
+            ImGui::SetCursorScreenPos(ImVec2(fcx, fbtnY));
+            ImGui::InvisibleButton("FWClose", ImVec2(fbtnS, fbtnS));
+            fDraw->AddCircleFilled(ImVec2(fcx + fbtnS * 0.5f, fbtnY + fbtnS * 0.5f), fbtnS * 0.48f,
+                                   ImGui::IsItemHovered() ? IM_COL32(255, 95, 95, 230) : IM_COL32(255, 120, 120, 200));
+            if (ImGui::IsItemClicked()) ExitFolderToRoot(camera);
+            // Maximize
+            fcx -= fbtnG + fbtnS;
+            ImGui::SetCursorScreenPos(ImVec2(fcx, fbtnY));
+            ImGui::InvisibleButton("FWMax", ImVec2(fbtnS, fbtnS));
+            fDraw->AddRectFilled(ImVec2(fcx + 2.0f, fbtnY + 2.0f), ImVec2(fcx + fbtnS - 2.0f, fbtnY + fbtnS - 2.0f),
+                                 ImGui::IsItemHovered() ? IM_COL32(255, 210, 90, 230) : IM_COL32(255, 225, 140, 200), 3.0f);
+            if (ImGui::IsItemClicked()) MakeFolderMaximized(camera);
+            // Minimize
+            fcx -= fbtnG + fbtnS;
+            ImGui::SetCursorScreenPos(ImVec2(fcx, fbtnY));
+            ImGui::InvisibleButton("FWMin", ImVec2(fbtnS, fbtnS));
+            fDraw->AddRectFilled(ImVec2(fcx + 3.0f, fbtnY + fbtnS * 0.5f), ImVec2(fcx + fbtnS - 3.0f, fbtnY + fbtnS * 0.5f + 2.0f),
+                                 ImGui::IsItemHovered() ? IM_COL32(110, 220, 140, 230) : IM_COL32(140, 235, 165, 200), 1.5f);
+            // Border
+            fDraw->AddRect(ImVec2((float)wr.left, (float)wr.top), ImVec2((float)wr.right, (float)wr.bottom),
+                           IM_COL32(60, 70, 100, 180), 4.0f, 0, 1.5f);
+            ImGui::PopID();
+        }
+
+        // Task View overlay
+        if (g_showDesktopOverview) {
+            ImGuiViewport* viewport = ImGui::GetMainViewport();
+            ImDrawList* ovDraw = ImGui::GetForegroundDrawList();
+            ImVec2 ovP = viewport->WorkPos;
+            ImVec2 ovS = viewport->WorkSize;
+            ImVec2 ovEnd = ImVec2(ovP.x + ovS.x, ovP.y + ovS.y);
+            ImVec2 ovCenter = ImVec2(ovP.x + ovS.x * 0.5f, ovP.y + ovS.y * 0.5f);
+
+            // Bright quartz acrylic background
+            ovDraw->AddRectFilled(ovP, ovEnd, IM_COL32(235, 240, 248, 220));
+            ovDraw->AddRectFilled(ovP, ovEnd, IM_COL32(250, 252, 255, 120));
+            for (int ring = 0; ring < 14; ++ring) {
+                float t = ring / 14.0f;
+                float inset = t * 150.0f;
+                float alpha = (int)(30.0f * (1.0f - t));
+                ovDraw->AddRect(ImVec2(ovP.x + inset, ovP.y + inset),
+                                ImVec2(ovEnd.x - inset, ovEnd.y - inset),
+                                IM_COL32(200, 210, 230, alpha), 60.0f, 0, 2.5f);
+            }
+
+            ImGui::SetNextWindowPos(ovP);
+            ImGui::SetNextWindowSize(ovS);
+            ImGui::SetNextWindowBgAlpha(0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::Begin("TaskViewOverlay", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+            // Sync cache
+            g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
+
+            // --- WINDOW CARDS ---
+            float cardW = 240.0f, cardH = 155.0f, cardGapX = 24.0f, cardGapY = 32.0f;
+            int cols = (int)((ovS.x - 100.0f + cardGapX) / (cardW + cardGapX));
+            if (cols < 3) cols = 3;
+            float totalCardW = cols * cardW + (cols - 1) * cardGapX;
+            float cardStartX = ovP.x + (ovS.x - totalCardW) * 0.5f;
+            float cardAreaTop = ovP.y + 60.0f;
+            float cardAreaBot = ovEnd.y - 140.0f;
+
+            int totalWindows = 0;
+            static std::vector<std::pair<HWND, std::wstring>> tvCards;
+            tvCards.clear();
+            for (const auto& w : g_hijackedWindows) {
+                if (!IsWindow(w.hwnd)) continue;
+                DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
+                std::wstring exePath = GetProcessPath(pid);
+                tvCards.push_back({ w.hwnd, exePath });
+                totalWindows++;
+            }
+
+            ovDraw->AddText(ImVec2(cardStartX, ovP.y + 24.0f), IM_COL32(60, 70, 100, 200),
+                            totalWindows > 0 ? "Active windows" : "");
+
+            for (int i = 0; i < totalWindows; ++i) {
+                HWND wh = tvCards[i].first;
+                int col = i % cols, row = i / cols;
+                float cx = cardStartX + col * (cardW + cardGapX);
+                float cy = cardAreaTop + row * (cardH + cardGapY);
+                ImVec2 c0 = ImVec2(cx, cy), c1 = ImVec2(cx + cardW, cy + cardH);
+
+                bool hovered = ImGui::IsMouseHoveringRect(c0, c1);
+                ImU32 cardBg = hovered ? IM_COL32(220, 226, 240, 230) : IM_COL32(240, 244, 250, 220);
+                ovDraw->AddRectFilled(ImVec2(cx + 2, cy + 3), ImVec2(c1.x + 2, c1.y + 3), IM_COL32(180, 185, 200, 50), 10.0f);
+                ovDraw->AddRectFilled(c0, c1, cardBg, 10.0f);
+                ovDraw->AddRect(c0, c1, hovered ? IM_COL32(150, 170, 210, 160) : IM_COL32(180, 190, 210, 60), 10.0f, 0, 1.5f);
+
+                // App icon
+                ID3D11ShaderResourceView* iconSrv = GetWindowIconTexture(g_pd3dDevice, wh, tvCards[i].second);
+                if (iconSrv) {
+                    float iconSz = 32.0f;
+                    ovDraw->AddImage((ImTextureID)iconSrv, ImVec2(cx + 14, cy + 14),
+                                     ImVec2(cx + 14 + iconSz, cy + 14 + iconSz));
+                } else {
+                    ovDraw->AddCircleFilled(ImVec2(cx + 30, cy + 30), 14.0f, IM_COL32(0, 120, 220, 180));
+                }
+
+                // Window title
+                WCHAR wtitle[256]; GetWindowTextW(wh, wtitle, 256);
+                char ctitle[256]; WideCharToMultiByte(CP_UTF8, 0, wtitle, -1, ctitle, 256, nullptr, nullptr);
+                if (ctitle[0] == 0) strcpy_s(ctitle, "(untitled)");
+                ovDraw->AddText(ImVec2(cx + 14, cy + cardH - 30.0f), IM_COL32(30, 40, 70, 230), ctitle);
+
+                // Click
+                ImGui::SetCursorScreenPos(c0);
+                char wid[32]; sprintf_s(wid, "TVC_%p", wh);
+                ImGui::InvisibleButton(wid, ImVec2(cardW, cardH));
+                if (ImGui::IsItemClicked()) {
+                    ShowWindow(wh, SW_SHOW); SetForegroundWindow(wh);
+                    g_showDesktopOverview = false;
+                }
+            }
+
+            // --- BOTTOM DESKTOP BAR ---
+            float barH = 120.0f;
+            float barY = ovEnd.y - barH;
+            float barX = ovP.x + 60.0f;
+            float barW2 = ovS.x - 120.0f;
+            ImVec2 b0 = ImVec2(barX, barY), b1 = ImVec2(barX + barW2, ovEnd.y - 8.0f);
+            ovDraw->AddRectFilled(b0, b1, IM_COL32(230, 236, 245, 245), 14.0f);
+            ovDraw->AddRectFilled(b0, b1, IM_COL32(245, 248, 252, 100), 14.0f);
+            ovDraw->AddRect(b0, b1, IM_COL32(190, 200, 220, 40), 14.0f, 0, 1.0f);
+            ovDraw->AddText(ImVec2(barX + 20, barY + 12), IM_COL32(80, 90, 120, 200), "Desktops");
+
+            float dsW = 140.0f, dsH = 70.0f, dsG = 12.0f;
+            float dsY = barY + 36.0f;
+            float addW = 40.0f;
+            int slotCount = GetDesktopSlotCount();
+            for (int i = 0; i < slotCount; ++i) {
+                float dx = barX + 20.0f + i * (dsW + dsG);
+                ImVec2 d0 = ImVec2(dx, dsY), d1 = ImVec2(dx + dsW, dsY + dsH);
+                bool active = (i == g_activeDesktopIndex && g_targetDesktopIndex < 0);
+                bool dH = ImGui::IsMouseHoveringRect(d0, d1);
+                ImU32 dFill = active ? IM_COL32(60, 140, 240, 200) : dH ? IM_COL32(210, 218, 235, 200) : IM_COL32(225, 232, 245, 150);
+                ovDraw->AddRectFilled(d0, d1, dFill, 6.0f);
+                ovDraw->AddRect(d0, d1, active ? IM_COL32(40, 130, 240, 200) : IM_COL32(180, 195, 220, 60), 6.0f, 0, 1.0f);
+
+                int miniW = (int)g_desktopWindows[i].size(); if (miniW > 7) miniW = 7;
+                if (miniW > 0) {
+                    float mw = 8.0f, mg = 3.0f, mTot = miniW * mw + (miniW - 1) * mg;
+                    float mx = dx + (dsW - mTot) * 0.5f, my = dsY + dsH - 16.0f;
+                    for (int m = 0; m < miniW; ++m)
+                        ovDraw->AddRectFilled(ImVec2(mx + m * (mw + mg), my), ImVec2(mx + m * (mw + mg) + mw, my + 4.0f),
+                                              active ? IM_COL32(60, 120, 200, 160) : IM_COL32(140, 155, 180, 80), 2.0f);
+                }
+                char dlbl[16]; sprintf_s(dlbl, "Desktop %d", i + 1);
+                ovDraw->AddText(ImVec2(dx + 8, dsY + 5), IM_COL32(40, 55, 90, 220), dlbl);
+                ImGui::SetCursorScreenPos(d0);
+                char did[16]; sprintf_s(did, "TVD%d", i);
+                ImGui::InvisibleButton(did, ImVec2(dsW, dsH));
+                if (ImGui::IsItemClicked()) { SwitchToDesktop(i); g_showDesktopOverview = false; }
+
+                if (slotCount > 1 && !active) {
+                    float cx = dx + dsW - 13, cy = dsY + 2;
+                    ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+                    char cid[16]; sprintf_s(cid, "TVC%d", i);
+                    ImGui::InvisibleButton(cid, ImVec2(11, 11));
+                    bool clH = ImGui::IsItemHovered();
+                    ovDraw->AddCircleFilled(ImVec2(cx + 5.5f, cy + 5.5f), 4.5f, clH ? IM_COL32(210, 55, 55, 200) : IM_COL32(90, 35, 35, 100));
+                    ovDraw->AddLine(ImVec2(cx + 2.5f, cy + 2.5f), ImVec2(cx + 8.5f, cy + 8.5f), IM_COL32(255, 180, 180, 160), 1.0f);
+                    ovDraw->AddLine(ImVec2(cx + 8.5f, cy + 2.5f), ImVec2(cx + 2.5f, cy + 8.5f), IM_COL32(255, 180, 180, 160), 1.0f);
+                    if (ImGui::IsItemClicked()) CloseDesktop(i);
+                }
+            }
+            // + button
+            float nx = barX + 20.0f + slotCount * (dsW + dsG);
+            ImVec2 n0 = ImVec2(nx, dsY), n1 = ImVec2(nx + addW, dsY + dsH);
+            bool nH = ImGui::IsMouseHoveringRect(n0, n1);
+            ovDraw->AddRectFilled(n0, n1, nH ? IM_COL32(210, 218, 235, 160) : IM_COL32(225, 232, 245, 90), 6.0f);
+            ovDraw->AddRect(n0, n1, IM_COL32(180, 195, 220, 40), 6.0f, 0, 1.0f);
+            ovDraw->AddLine(ImVec2(nx + addW * 0.5f, dsY + dsH * 0.28f), ImVec2(nx + addW * 0.5f, dsY + dsH * 0.72f), nH ? IM_COL32(60, 80, 120, 200) : IM_COL32(120, 140, 170, 100), 2.2f);
+            ovDraw->AddLine(ImVec2(nx + addW * 0.28f, dsY + dsH * 0.5f), ImVec2(nx + addW * 0.72f, dsY + dsH * 0.5f), nH ? IM_COL32(60, 80, 120, 200) : IM_COL32(120, 140, 170, 100), 2.2f);
+            ImGui::SetCursorScreenPos(n0);
+            ImGui::InvisibleButton("TVAdd", ImVec2(addW, dsH));
+            if (ImGui::IsItemClicked()) { CreateNewDesktop(); g_showDesktopOverview = false; }
+
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+
+            if ((ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered())
+                || ImGui::IsKeyPressed(ImGuiKey_Escape))
+                g_showDesktopOverview = false;
         }
 
         // Clean up dead hijacked windows every frame
@@ -1817,8 +2475,17 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
         
+        // Check if mouse is inside the folder portal window
+        bool mouseInPortal = false;
+        if (g_isInFolder && !g_isFolderMaximized) {
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            RECT& fwr = g_folderWindowRect;
+            mouseInPortal = (mp.x >= fwr.left && mp.x <= fwr.right && mp.y >= fwr.top && mp.y <= fwr.bottom);
+        }
+
         int hitAppIndex = -1;
         float minDistance = 9999.0f;
+        if (!mouseInPortal) {
         for (int i = 0; i < g_myApps.size(); i++) {
             g_myApps[i].IsHovered = false;
             DirectX::BoundingBox box(g_myApps[i].Position, DirectX::XMFLOAT3(0.6f, 0.6f, 0.3f));
@@ -1828,12 +2495,87 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
         if (hitAppIndex != -1) g_myApps[hitAppIndex].IsHovered = true;
+        } // !mouseInPortal guard
 
+        // Portal cube interaction (full mirror of desktop)
+        int portalHitIdx = -1;
+        if (mouseInPortal && !g_folderCubes.empty()) {
+            float fwW = (float)(g_folderWindowRect.right - g_folderWindowRect.left);
+            float fwH = (float)(g_folderWindowRect.bottom - g_folderWindowRect.top);
+            DirectX::XMMATRIX fVP = g_folderCamera.GetViewMatrix() * g_folderCamera.GetProjectionMatrix(90.0f, fwW/(fwH>0?fwH:1.0f), 0.1f, 100.0f);
+            DirectX::XMMATRIX fInvVP = DirectX::XMMatrixInverse(nullptr, fVP);
+            ImVec2 m = ImGui::GetIO().MousePos;
+            float fmx = (m.x - g_folderWindowRect.left) / fwW * 2.0f - 1.0f;
+            float fmy = 1.0f - (m.y - g_folderWindowRect.top) / fwH * 2.0f;
+            DirectX::XMVECTOR fNear = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 0, 1), fInvVP);
+            DirectX::XMVECTOR fFar  = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 1, 1), fInvVP);
+            DirectX::XMVECTOR fOri = DirectX::XMLoadFloat3(&g_folderCamera.Position);
+            DirectX::XMVECTOR fDir = DirectX::XMVector3Normalize(DirectX::XMVectorSubtract(fFar, fOri));
+            float fMin = 9999.0f;
+            for (int i = 0; i < (int)g_folderCubes.size(); i++) {
+                g_folderCubes[i].IsHovered = false;
+                DirectX::BoundingBox box(g_folderCubes[i].Position, DirectX::XMFLOAT3(0.6f,0.6f,0.3f));
+                float d; if (box.Intersects(fOri, fDir, d) && d < fMin) { fMin = d; portalHitIdx = i; }
+            }
+            if (portalHitIdx >= 0) g_folderCubes[portalHitIdx].IsHovered = true;
+
+            static DWORD pLastClickT = 0; static int pLastIdx = -1;
+            static int pGrabIdx = -1; static bool pDragging = false;
+            static DWORD pDownTime = 0; static float pDragDist = 8.0f;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (portalHitIdx >= 0) {
+                    if (GetTickCount() - pLastClickT < 400 && pLastIdx == portalHitIdx) {
+                        pLastClickT = 0;
+                        if (IsPathDirectory(g_folderCubes[portalHitIdx].AppPath)) {
+                            EnterFolder(g_folderCubes[portalHitIdx].AppPath, camera);
+                        } else {
+                            LaunchAppByPath(g_folderCubes[portalHitIdx].AppPath.c_str());
+                        }
+                    } else {
+                        pLastClickT = GetTickCount(); pLastIdx = portalHitIdx;
+                        if (!g_ctrlHeld) { for (auto& c : g_folderCubes) c.IsSelected = false; }
+                        g_folderCubes[portalHitIdx].IsSelected = true;
+                        pGrabIdx = portalHitIdx; pDownTime = GetTickCount();
+                        DirectX::XMVECTOR cPos = fOri;
+                        DirectX::XMVECTOR aPos = DirectX::XMLoadFloat3(&g_folderCubes[portalHitIdx].Position);
+                        pDragDist = DirectX::XMVectorGetX(DirectX::XMVector3Length(DirectX::XMVectorSubtract(aPos, cPos)));
+                        if (pDragDist < 3.0f) pDragDist = 8.0f;
+                    }
+                } else {
+                    if (!g_ctrlHeld) { for (auto& c : g_folderCubes) c.IsSelected = false; }
+                }
+            }
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && pGrabIdx >= 0) {
+                if (GetTickCount() - pDownTime > 150) {
+                    pDragging = true;
+                    DirectX::XMVECTOR newPos = DirectX::XMVectorAdd(fOri, DirectX::XMVectorScale(fDir, pDragDist));
+                    DirectX::XMFLOAT3 tp; DirectX::XMStoreFloat3(&tp, newPos);
+                    DirectX::XMFLOAT3 delta = { tp.x - g_folderCubes[pGrabIdx].Position.x,
+                                                 tp.y - g_folderCubes[pGrabIdx].Position.y,
+                                                 tp.z - g_folderCubes[pGrabIdx].Position.z };
+                    for (int i = 0; i < (int)g_folderCubes.size(); ++i) {
+                        if (!g_folderCubes[i].IsSelected) continue;
+                        g_folderCubes[i].Position.x += delta.x;
+                        g_folderCubes[i].Position.y += delta.y;
+                        g_folderCubes[i].Position.z += delta.z;
+                    }
+                }
+            }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && pGrabIdx >= 0) {
+                pGrabIdx = -1; pDragging = false;
+            }
+        }
+
+        if (!mouseInPortal) {
         if (g_leftClicked) {
             if (hitAppIndex != -1) {
                 if (GetTickCount() - g_lastClickTime < 400 && g_lastClickedApp == hitAppIndex) {
                     g_previousUiUnlocked = g_uiUnlocked;
-                    LaunchAppByPath(g_myApps[hitAppIndex].AppPath.c_str());
+                    if (IsPathDirectory(g_myApps[hitAppIndex].AppPath)) {
+                        EnterFolder(g_myApps[hitAppIndex].AppPath, camera);
+                    } else {
+                        LaunchAppByPath(g_myApps[hitAppIndex].AppPath.c_str());
+                    }
                     g_lastClickTime = 0;
                 } else {
                     g_lastClickTime = GetTickCount();
@@ -1846,7 +2588,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     }
                     g_myApps[hitAppIndex].IsSelected = true;
 
-                    if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
+        bool portalLocked = false;
+        if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                         g_grabbedAppIndex = hitAppIndex;
                         g_mouseDownTime = GetTickCount();
                         DirectX::XMVECTOR cPos = DirectX::XMLoadFloat3(&camera.Position);
@@ -1886,7 +2629,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     g_myApps.erase(g_myApps.begin() + i);
                 }
             }
-            SaveDesktopState(g_myApps);
+            SaveDesktopState(g_myApps, g_activeDesktopIndex);
         }
 
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (g_lButtonHeld)) {
@@ -2005,7 +2748,25 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             bool wasDragging = g_isDragging || g_isBlankDragging;
             g_grabbedAppIndex = -1; g_isDragging = false; g_isBlankDragging = false;
             g_dropTargetIndex = -1;
-            if (wasDragging) SaveDesktopState(g_myApps);
+            if (!g_isFolderMaximized) SaveDesktopState(g_myApps, g_activeDesktopIndex);
+        }
+        } // !mouseInPortal
+
+        // Virtual desktop transition
+        if (g_targetDesktopIndex >= 0) {
+            float prev = g_desktopTransition;
+            g_desktopTransition += g_desktopTransitionSpeed * dt;
+            if (prev < 0.5f && g_desktopTransition >= 0.5f) {
+                CompleteDesktopSwitch();
+            }
+            if (g_desktopTransition >= 1.0f) {
+                g_desktopTransition = 1.0f;
+            }
+        }
+        float desktopAlpha = 1.0f;
+        if (g_targetDesktopIndex >= 0) {
+            float t = g_desktopTransition;
+            desktopAlpha = (t < 0.5f) ? (1.0f - t * 2.0f) : ((t - 0.5f) * 2.0f);
         }
 
         ImDrawList* bg_draw_list = ImGui::GetBackgroundDrawList();
@@ -2028,6 +2789,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     drawColor = DirectX::XMFLOAT4(app.BaseColor.x * 0.15f, app.BaseColor.y * 0.15f, app.BaseColor.z * 0.15f, 0.3f);
                 }
             }
+            drawColor.w *= desktopAlpha;
             float spinAngle = 0.0f;
             float orbitAngle = 0.0f;
             float tiltAngle = 0.0f;
@@ -2040,14 +2802,18 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             
             // 🚨 3D 全息投影到 2D 屏幕文字
             DirectX::XMVECTOR appPos = DirectX::XMLoadFloat3(&app.Position);
-            // 将文字位置放在方块正下方 0.75 米处
             appPos = DirectX::XMVectorSubtract(appPos, DirectX::XMVectorSet(0.0f, 0.75f, 0.0f, 0.0f)); 
             DirectX::XMVECTOR clipSpace = DirectX::XMVector3TransformCoord(appPos, viewMatrix * projMatrix);
             
-            // 确保图标在摄像机前面且未超出视野
             if (DirectX::XMVectorGetZ(clipSpace) > 0.0f && DirectX::XMVectorGetZ(clipSpace) < 1.0f) {
                 float screenX = (DirectX::XMVectorGetX(clipSpace) + 1.0f) * 0.5f * width;
                 float screenY = (1.0f - DirectX::XMVectorGetY(clipSpace)) * 0.5f * height;
+
+                // Skip labels inside portal window (they belong to the folder's world)
+                if (g_isInFolder && !g_isFolderMaximized) {
+                    RECT& fwr = g_folderWindowRect;
+                    if (screenX >= fwr.left && screenX <= fwr.right && screenY >= fwr.top && screenY <= fwr.bottom) continue;
+                }
                 
                 ImVec2 textSize = ImGui::CalcTextSize(app.AppName.c_str());
                 ImVec2 textPos = ImVec2(screenX - textSize.x * 0.5f, screenY - textSize.y * 0.5f);
@@ -2125,6 +2891,42 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, camera.Position, canvasScale, anglesFront, nullptr, camera.Position, 5, viewMatrix, 7.6f);
         }
 
+        // Folder portal rendering (windowed mode)
+        if (g_isInFolder && !g_isFolderMaximized && !g_folderCubes.empty()) {
+            RECT wr = g_folderWindowRect;
+            D3D11_RECT scissor = { (LONG)wr.left, (LONG)wr.top, (LONG)wr.right, (LONG)wr.bottom };
+            g_pd3dDeviceContext->RSSetScissorRects(1, &scissor);
+            D3D11_VIEWPORT savedVp, folderVp;
+            UINT vpCount = 1;
+            g_pd3dDeviceContext->RSGetViewports(&vpCount, &savedVp);
+            folderVp.TopLeftX = (float)wr.left; folderVp.TopLeftY = (float)wr.top;
+            folderVp.Width = (float)(wr.right - wr.left); folderVp.Height = (float)(wr.bottom - wr.top);
+            folderVp.MinDepth = 0.0f; folderVp.MaxDepth = 1.0f;
+            g_pd3dDeviceContext->RSSetViewports(1, &folderVp);
+            float portalAspect = folderVp.Width / (folderVp.Height > 0 ? folderVp.Height : 1.0f);
+            DirectX::XMMATRIX folderView = g_folderCamera.GetViewMatrix();
+            DirectX::XMMATRIX folderProj = g_folderCamera.GetProjectionMatrix(90.0f, portalAspect, 0.1f, 100.0f);
+            // Light gray background plane behind folder cubes
+            DirectX::XMFLOAT3 fw = g_folderCamera.GetForward();
+            DirectX::XMFLOAT3 bgPlanePos = { g_folderCamera.Position.x + fw.x * 30.0f,
+                                              g_folderCamera.Position.y + fw.y * 30.0f,
+                                              g_folderCamera.Position.z + fw.z * 30.0f };
+            DirectX::XMFLOAT3 bgPlaneScl = { 60.0f, 40.0f, 0.01f };
+            DirectX::XMFLOAT4 bgPlaneClr = { 0.72f, 0.73f, 0.78f, 1.0f };
+            cubeRenderer.Render(g_pd3dDeviceContext, folderView * folderProj, bgPlanePos, bgPlaneScl, bgPlaneClr,
+                                nullptr, g_folderCamera.Position, 0, folderView, 8.0f);
+            for (auto& app : g_folderCubes) {
+                int fhState = app.IsSelected ? (app.IsHovered ? 3 : 2) : (app.IsHovered ? 1 : 0);
+                DirectX::XMFLOAT3 fScale = { 1.0f, 1.0f, 0.5f };
+                DirectX::XMFLOAT4 fColor = app.BaseColor;
+                cubeRenderer.Render(g_pd3dDeviceContext, folderView * folderProj, app.Position, fScale, fColor,
+                                    app.IconTexture, g_folderCamera.Position, fhState, folderView, 8.0f);
+            }
+            g_pd3dDeviceContext->RSSetViewports(1, &savedVp);
+            D3D11_RECT fullScissor = { 0, 0, (LONG)ImGui::GetMainViewport()->WorkSize.x, (LONG)ImGui::GetMainViewport()->WorkSize.y };
+            g_pd3dDeviceContext->RSSetScissorRects(1, &fullScissor);
+        }
+
         if (g_rightClickedCubeIndex >= 0 && g_rightClickedCubeIndex < (int)g_myApps.size()) {
             ImGui::OpenPopup("CubeContextMenu");
         }
@@ -2140,13 +2942,67 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 if (ImGui::MenuItem("Remove")) {
                     if (g_myApps[idx].IconTexture) g_myApps[idx].IconTexture->Release();
                     g_myApps.erase(g_myApps.begin() + idx);
-                    SaveDesktopState(g_myApps);
+            if (!g_isFolderMaximized) SaveDesktopState(g_myApps, g_activeDesktopIndex);
                     g_rightClickedCubeIndex = -1;
                 }
             }
             ImGui::EndPopup();
         }
         g_rightClickedCubeIndex = -1;
+
+        // Folder portal interaction (windowed mode)
+        if (g_isInFolder && !g_isFolderMaximized && !g_folderCubes.empty()) {
+            RECT& fwr = g_folderWindowRect;
+            float fwW = (float)(fwr.right - fwr.left), fwH = (float)(fwr.bottom - fwr.top);
+            DirectX::XMMATRIX fInvVP = DirectX::XMMatrixInverse(nullptr,
+                g_folderCamera.GetViewMatrix() * g_folderCamera.GetProjectionMatrix(90.0f, fwW / (fwH > 0 ? fwH : 1.0f), 0.1f, 100.0f));
+            ImVec2 mouse = ImGui::GetIO().MousePos;
+            bool mouseInsidePortal = (mouse.x >= fwr.left && mouse.x <= fwr.right && mouse.y >= fwr.top && mouse.y <= fwr.bottom);
+            float fmx = (mouse.x - fwr.left) / fwW;
+            float fmy = (mouse.y - fwr.top) / fwH;
+            fmx = fmx * 2.0f - 1.0f;
+            fmy = 1.0f - fmy * 2.0f;
+            DirectX::XMVECTOR fnear = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 0.0f, 1.0f), fInvVP);
+            DirectX::XMVECTOR ffar = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 1.0f, 1.0f), fInvVP);
+            DirectX::XMVECTOR fOrigin = DirectX::XMLoadFloat3(&g_folderCamera.Position);
+            DirectX::XMVECTOR fRayDir = DirectX::XMVector3Normalize(DirectX::XMVectorSubtract(ffar, fOrigin));
+
+            int fHitIdx = -1;
+            float fMinDist = 9999.0f;
+            for (int i = 0; i < (int)g_folderCubes.size(); ++i) {
+                g_folderCubes[i].IsHovered = false;
+                DirectX::BoundingBox box(g_folderCubes[i].Position, DirectX::XMFLOAT3(0.6f, 0.6f, 0.3f));
+                float dist;
+                if (box.Intersects(fOrigin, fRayDir, dist)) {
+                    if (dist < fMinDist) { fMinDist = dist; fHitIdx = i; }
+                }
+            }
+            if (fHitIdx >= 0) g_folderCubes[fHitIdx].IsHovered = true;
+
+            static DWORD s_fLastClickT = 0;
+            static int s_fLastIdx = -1;
+            if (mouseInsidePortal && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && fHitIdx >= 0) {
+                if (GetTickCount() - s_fLastClickT < 400 && s_fLastIdx == fHitIdx) {
+                    if (IsPathDirectory(g_folderCubes[fHitIdx].AppPath)) {
+                        EnterFolder(g_folderCubes[fHitIdx].AppPath, camera);
+                    } else {
+                        LaunchAppByPath(g_folderCubes[fHitIdx].AppPath.c_str());
+                    }
+                    s_fLastClickT = 0;
+                } else {
+                    s_fLastClickT = GetTickCount();
+                    s_fLastIdx = fHitIdx;
+                    if (!g_ctrlHeld) {
+                        for (auto& c : g_folderCubes) c.IsSelected = false;
+                    }
+                    g_folderCubes[fHitIdx].IsSelected = true;
+                }
+            }
+            // Click on empty area in portal deselects
+            if (mouseInsidePortal && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && fHitIdx < 0) {
+                for (auto& c : g_folderCubes) c.IsSelected = false;
+            }
+        }
 
         g_leftClicked = false;
         ImGui::Render();
@@ -2165,10 +3021,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         UnregisterHotKey(hwnd, 1);
     }
     UnregisterHotKey(hwnd, 2);
+    UnregisterHotKey(hwnd, 3);
+    UnregisterHotKey(hwnd, 4);
     if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
     if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
     SetSystemTaskbarVisible(true);
-    SaveDesktopState(g_myApps);
+    if (g_isFolderMaximized) {
+        SaveDesktopState(g_desktopBackupCubes, g_activeDesktopIndex);
+    } else {
+        SaveDesktopState(g_myApps, g_activeDesktopIndex);
+    }
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;

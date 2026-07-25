@@ -146,8 +146,70 @@ static void ScanDesktopForApps(std::vector<AppCube>& outApps) {
     }
 }
 
-static void SaveDesktopState(const std::vector<AppCube>& apps) {
-    const wchar_t* fname = L"desktop.cddesk";
+static void ScanFolderForApps(const std::wstring& folderPath, std::vector<AppCube>& outApps) {
+    std::vector<std::pair<std::wstring, std::string>> entries;
+    std::wstring searchPath = folderPath + L"\\*.*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+        std::wstring fname(fd.cFileName);
+        if (fname == L"." || fname == L"..") continue;
+        std::wstring fullPath = folderPath + L"\\" + fname;
+        size_t dot = fname.rfind(L'.');
+        std::wstring ext = (dot != std::wstring::npos) ? fname.substr(dot) : L"";
+        std::wstring nameOnly = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
+        std::wstring targetPath;
+        std::string displayName = WcsToUtf8(nameOnly);
+        bool include = false;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            targetPath = fullPath; include = true;
+        } else if (_wcsicmp(ext.c_str(), L".lnk") == 0) {
+            targetPath = ResolveShortcutTarget(fullPath.c_str());
+            if (targetPath.empty()) continue;
+            include = true;
+        } else if (_wcsicmp(ext.c_str(), L".exe") == 0) {
+            targetPath = fullPath; include = true;
+        } else if (!ext.empty() && _wcsicmp(ext.c_str(), L".ini") != 0 && _wcsicmp(ext.c_str(), L".log") != 0 && _wcsicmp(ext.c_str(), L".tmp") != 0) {
+            targetPath = fullPath; include = true;
+        }
+        if (include) { entries.push_back({ targetPath, displayName }); }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    const int count = (int)entries.size();
+    if (count == 0) return;
+    const float radius = 8.0f;
+    const DirectX::XMFLOAT3 sphereCenter = { 0.0f, 1.5f, 0.0f };
+    int cols = (int)ceilf(sqrtf((float)count * 1.6f));
+    if (cols < 1) cols = 1;
+    int rows = (count + cols - 1) / cols;
+    const float yawMin = DirectX::XMConvertToRadians(-50.0f);
+    const float yawMax = DirectX::XMConvertToRadians(15.0f);
+    const float pitchMax = DirectX::XMConvertToRadians(30.0f);
+    const float pitchMin = DirectX::XMConvertToRadians(-28.0f);
+    for (int idx = 0; idx < count; ++idx) {
+        int col = idx % cols;
+        int row = idx / cols;
+        float yaw = (cols > 1) ? yawMin + (yawMax - yawMin) * col / (float)(cols - 1) : (yawMin + yawMax) * 0.5f;
+        float pitch = (rows > 1) ? pitchMax + (pitchMin - pitchMax) * row / (float)(rows - 1) : (pitchMax + pitchMin) * 0.5f;
+        float dx = sinf(yaw) * cosf(pitch);
+        float dy = sinf(pitch);
+        float dz = cosf(yaw) * cosf(pitch);
+        AppCube cube = {};
+        cube.Position = DirectX::XMFLOAT3(sphereCenter.x + dx * radius, sphereCenter.y + dy * radius, sphereCenter.z + dz * radius);
+        cube.BaseColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.3f, 1.0f);
+        cube.AppPath = entries[idx].first;
+        cube.AppName = entries[idx].second;
+        outApps.push_back(cube);
+    }
+}
+
+static void SaveDesktopState(const std::vector<AppCube>& apps, int desktopIndex = 0) {
+    wchar_t fname[64];
+    if (desktopIndex == 0) wcscpy_s(fname, L"desktop.cddesk");
+    else swprintf_s(fname, L"desktop_%d.cddesk", desktopIndex);
     HANDLE hFile = CreateFileW(fname, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD written;
@@ -169,8 +231,10 @@ static void SaveDesktopState(const std::vector<AppCube>& apps) {
     CloseHandle(hFile);
 }
 
-static void LoadDesktopState(std::vector<AppCube>& apps) {
-    const wchar_t* fname = L"desktop.cddesk";
+static void LoadDesktopState(std::vector<AppCube>& apps, int desktopIndex = 0) {
+    wchar_t fname[64];
+    if (desktopIndex == 0) wcscpy_s(fname, L"desktop.cddesk");
+    else swprintf_s(fname, L"desktop_%d.cddesk", desktopIndex);
     HANDLE hFile = CreateFileW(fname, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD bytesRead;
