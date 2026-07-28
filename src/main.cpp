@@ -91,6 +91,9 @@ int   g_rightClickedCubeIndex = -1;
 bool  g_rightClicked = false;
 bool  g_deleteRequested = false;
 bool  g_exitFolderRequested = false;
+bool  g_showWindowSwitcher = false;
+int   g_switcherSelected = 0;
+static std::vector<std::pair<HWND, std::wstring>> g_switcherWindows;
 
 bool  g_isBlankDragging = false;
 float g_dragStartYaw = 0.0f;
@@ -540,6 +543,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_showDesktopOverview = !g_showDesktopOverview;
         return 0;
     }
+    if (msg == WM_HOTKEY && wParam == 5) {
+        if (!g_showWindowSwitcher) {
+            g_switcherWindows.clear();
+            for (const auto& w : g_hijackedWindows) {
+                if (IsWindow(w.hwnd) && IsWindowVisible(w.hwnd)) {
+                    DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
+                    g_switcherWindows.push_back({ w.hwnd, GetProcessPath(pid) });
+                }
+            }
+            if (!g_switcherWindows.empty()) {
+                g_showWindowSwitcher = true;
+                g_switcherSelected = 0;
+            }
+        }
+        return 0;
+    }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
         toggleUiUnlock(hWnd);
         return 0;
@@ -684,6 +703,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_KEYDOWN:
+            if (g_showWindowSwitcher) {
+                if (wParam == VK_TAB) {
+                    int n = (int)g_switcherWindows.size();
+                    if (n > 0) g_switcherSelected = (g_switcherSelected + 1) % n;
+                    return 0;
+                }
+                if (wParam == VK_ESCAPE) { g_showWindowSwitcher = false; return 0; }
+                return 0;
+            }
             if (wParam == VK_CONTROL) g_ctrlHeld = true;
             if (wParam == VK_ESCAPE) PostQuitMessage(0);
             if (g_ctrlHeld && (GetKeyState(VK_MENU) & 0x8000)) {
@@ -727,6 +755,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_KEYUP:
+            if (g_showWindowSwitcher && wParam == VK_CONTROL) {
+                if (g_switcherSelected >= 0 && g_switcherSelected < (int)g_switcherWindows.size()) {
+                    SetForegroundWindow(g_switcherWindows[g_switcherSelected].first);
+                }
+                g_showWindowSwitcher = false;
+                return 0;
+            }
             if (wParam == VK_CONTROL) g_ctrlHeld = false;
             return 0;
 
@@ -758,6 +793,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_ESCAPE);
     RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'D');
     RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
+    RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_NOREPEAT, VK_TAB);
     Logger::Instance().Init();
     SetSystemTaskbarVisible(false);
     DragAcceptFiles(hwnd, TRUE);
@@ -2891,6 +2927,58 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, camera.Position, canvasScale, anglesFront, nullptr, camera.Position, 5, viewMatrix, 7.6f);
         }
 
+        // Alt+Tab window switcher overlay
+        if (g_showWindowSwitcher && !g_switcherWindows.empty()) {
+            ImDrawList* swDraw = ImGui::GetForegroundDrawList();
+            ImVec2 swP = ImGui::GetMainViewport()->WorkPos;
+            ImVec2 swE = ImVec2(swP.x + ImGui::GetMainViewport()->WorkSize.x, swP.y + ImGui::GetMainViewport()->WorkSize.y);
+            swDraw->AddRectFilled(swP, swE, IM_COL32(8, 12, 28, 235));
+
+            int n = (int)g_switcherWindows.size();
+            // Arc layout: cards arranged in a horizontal curve in front of camera
+            float cardW = 1.4f, cardH = 1.0f, cardD = 0.03f;
+            float arcRadius = 5.0f;
+            float totalArc = DirectX::XMConvertToRadians(60.0f);
+            float startYaw = -totalArc * 0.5f;
+            DirectX::XMFLOAT3 camPos = camera.Position;
+            DirectX::XMFLOAT3 camFwd = camera.GetForward();
+
+            for (int i = 0; i < n; ++i) {
+                bool sel = (i == g_switcherSelected);
+                float t = (n > 1) ? (float)i / (n - 1) : 0.5f;
+                float yaw = startYaw + totalArc * t;
+                // Position in world space relative to camera
+                float cx = camPos.x + camFwd.x * arcRadius - sinf(yaw) * (n > 1 ? (i - n/2) * 1.8f : 0.0f);
+                float cy = camPos.y + 1.0f;
+                float cz = camPos.z + camFwd.z * arcRadius;
+                DirectX::XMFLOAT3 cardPos = { cx + sinf(yaw) * 3.0f, cy, cz };
+                DirectX::XMFLOAT3 cardScl = sel ? DirectX::XMFLOAT3{cardW*1.15f, cardH*1.15f, cardD} : DirectX::XMFLOAT3{cardW, cardH, cardD};
+                DirectX::XMFLOAT4 cardCol = sel ? DirectX::XMFLOAT4{0.25f, 0.3f, 0.45f, 1.0f} : DirectX::XMFLOAT4{0.12f, 0.14f, 0.22f, 0.7f};
+                float cardSpin = yaw * 0.5f;
+
+                ID3D11ShaderResourceView* icon = GetWindowIconTexture(g_pd3dDevice, g_switcherWindows[i].first, g_switcherWindows[i].second);
+                cubeRenderer.Render(g_pd3dDeviceContext, viewMatrix * projMatrix, cardPos, cardScl, cardCol, icon,
+                                    camPos, sel ? 3 : 0, viewMatrix, arcRadius, cardSpin);
+                // Card title label
+                DirectX::XMVECTOR cp = DirectX::XMLoadFloat3(&cardPos);
+                cp = DirectX::XMVectorSubtract(cp, DirectX::XMVectorSet(0.0f, cardH * 0.6f, 0.0f, 0.0f));
+                DirectX::XMVECTOR cs = DirectX::XMVector3TransformCoord(cp, viewMatrix * projMatrix);
+                if (DirectX::XMVectorGetZ(cs) > 0.0f && DirectX::XMVectorGetZ(cs) < 1.0f) {
+                    float sx = (DirectX::XMVectorGetX(cs) + 1.0f) * 0.5f * width;
+                    float sy = (1.0f - DirectX::XMVectorGetY(cs)) * 0.5f * height;
+                    WCHAR wt[256]; GetWindowTextW(g_switcherWindows[i].first, wt, 256);
+                    char ct[256]; WideCharToMultiByte(CP_UTF8, 0, wt, -1, ct, 256, nullptr, nullptr);
+                    if (ct[0] == 0) strcpy_s(ct, "(untitled)");
+                    ImVec2 ts = ImGui::CalcTextSize(ct);
+                    ImU32 tc = sel ? IM_COL32(180, 210, 255, 255) : IM_COL32(120, 130, 150, 180);
+                    swDraw->AddText(ImVec2(sx - ts.x * 0.5f, sy), tc, ct);
+                }
+            }
+            // Hint text
+            swDraw->AddText(ImVec2(swP.x + 30, swP.y + 30), IM_COL32(150, 160, 180, 200),
+                            "Tab = next  |  Release Ctrl = switch  |  Esc = cancel");
+        }
+
         // Folder portal rendering (windowed mode)
         if (g_isInFolder && !g_isFolderMaximized && !g_folderCubes.empty()) {
             RECT wr = g_folderWindowRect;
@@ -3023,6 +3111,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     UnregisterHotKey(hwnd, 2);
     UnregisterHotKey(hwnd, 3);
     UnregisterHotKey(hwnd, 4);
+    UnregisterHotKey(hwnd, 5);
     if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
     if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
     SetSystemTaskbarVisible(true);
