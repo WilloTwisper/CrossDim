@@ -43,6 +43,7 @@ public:
             setvbuf(m_file, nullptr, _IONBF, 0);
         }
         m_logDir = dir;
+        m_logFilePath = buf;
 
         PruneOldLogs();
 
@@ -89,12 +90,16 @@ public:
         WideCharToMultiByte(CP_UTF8, 0, msg, -1, narrow, sizeof(narrow), nullptr, nullptr);
         Log("%s", narrow);
     }
-    
+
+    // Returns the full path of the current session's log file.
+    const std::string& GetCurrentLogPath() const { return m_logFilePath; }
+
 private:
     Logger() = default;
     bool m_inited = false;
     FILE* m_file = nullptr;
     std::string m_logDir;
+    std::string m_logFilePath;
 
     void PruneOldLogs() {
         if (m_logDir.empty()) return;

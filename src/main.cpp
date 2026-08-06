@@ -40,6 +40,8 @@
 #include "Shell/DesktopManager.h"
 #include "Shell/WindowManager.h"
 #include "Shell/SystemInfo.h"
+#include "Shell/AIServer.h"
+#include "Engine/JsonUtils.h"
 enum CrossDimState {
     STATE_3D_EXPLORE,
     STATE_2D_WORKBENCH
@@ -94,6 +96,8 @@ bool  g_exitFolderRequested = false;
 bool  g_showWindowSwitcher = false;
 int   g_switcherSelected = 0;
 static std::vector<std::pair<HWND, std::wstring>> g_switcherWindows;
+static int g_aiFrameW = 1;
+static int g_aiFrameH = 1;
 
 bool  g_isBlankDragging = false;
 float g_dragStartYaw = 0.0f;
@@ -147,6 +151,7 @@ static void CompleteDesktopSwitch() {
     g_activeDesktopIndex = g_targetDesktopIndex;
     g_targetDesktopIndex = -1;
     g_desktopTransition = 1.0f;
+    AIServer::EmitEvent("desktop_switch", "{\"index\":" + std::to_string(g_activeDesktopIndex) + "}");
 }
 
 static void CreateNewDesktop() {
@@ -169,6 +174,7 @@ static void CreateNewDesktop() {
     ScanDesktopForApps(g_myApps);
     LoadDesktopState(g_myApps, g_activeDesktopIndex);
     LoadIconsForApps(g_myApps);
+    AIServer::EmitEvent("desktop_create", "{\"index\":" + std::to_string(g_activeDesktopIndex) + "}");
 }
 
 static void CloseDesktop(int slotIdx) {
@@ -206,6 +212,7 @@ static void CloseDesktop(int slotIdx) {
         g_desktopWindows.erase(g_desktopWindows.begin() + removeSlot);
         if (g_activeDesktopIndex > slotIdx) g_activeDesktopIndex--;
     }
+    AIServer::EmitEvent("desktop_close", "{\"slot\":" + std::to_string(slotIdx) + ",\"count\":" + std::to_string(g_desktopSlots.size()) + "}");
 }
 
 // Spatial folder navigation
@@ -286,6 +293,7 @@ static void EnterFolder(const std::wstring& path, Camera& camera) {
     LONG cx = (g_folderWindowRect.left + g_folderWindowRect.right) / 2;
     LONG cy = (g_folderWindowRect.top + g_folderWindowRect.bottom) / 2;
     SetCursorPos(cx, cy);
+    AIServer::EmitEvent("folder_enter", "{\"path\":\"" + Json::Escape(WcsToUtf8(path)) + "\",\"depth\":" + std::to_string(g_folderStack.size()) + "}");
 }
 
 static void ExitFolderToParent(Camera& camera) {
@@ -320,6 +328,7 @@ static void ExitFolderToParent(Camera& camera) {
         g_folderStack.back().cubes = pcubes;
         for (auto& c : g_folderStack.back().cubes) c.IconTexture = nullptr;
     }
+    AIServer::EmitEvent("folder_exit", "{\"depth\":" + std::to_string(g_folderStack.size()) + "}");
 }
 
 static void ExitFolderToRoot(Camera& camera) {
@@ -338,6 +347,7 @@ static void ExitFolderToRoot(Camera& camera) {
     g_isFolderMaximized = true;
     camera.Position = g_desktopBackupCamPos;
     camera.Rotation = g_desktopBackupCamRot;
+    AIServer::EmitEvent("folder_exit", "{\"depth\":0}");
 }
 
 static void MakeFolderWindowed(Camera& mainCam) {
@@ -388,6 +398,478 @@ static void MakeFolderMaximized(Camera& mainCam) {
     g_folderTransitionT = 0.0f;
 }
 
+// ==================== AI Control Interface ====================
+// These functions run on the main thread (called from the render loop).
+// The HTTP server (AIServer.h) exchanges state through atomics/mutexes.
+static void LaunchAppByPath(LPCWSTR appPath);
+extern DirectX::XMFLOAT3 g_modelPosition;
+extern DirectX::XMFLOAT3 g_modelRotation;
+extern float g_modelScale;
+extern float g_modelFov;
+extern DirectX::XMFLOAT4 g_modelMatParams;
+extern DirectX::XMFLOAT4 g_modelColorTint;
+
+static void BuildStateSnapshot(Camera& camera) {
+    std::string js = "{";
+    // Core state
+    char coreBuf[256];
+    sprintf_s(coreBuf, "\"mode\":\"%s\",\"uiUnlocked\":%s,\"fps\":%.1f,\"tmpFps\":%.1f",
+              (g_currentState == STATE_2D_WORKBENCH) ? "2D" : "3D",
+              g_uiUnlocked ? "true" : "false", g_fpsCurrent, g_fpsCurrent);
+    js += coreBuf;
+    // Camera
+    char camBuf[128];
+    sprintf_s(camBuf, ",\"camera\":{\"pos\":[%.2f,%.2f,%.2f],\"rot\":[%.2f,%.2f,%.2f]}",
+              camera.Position.x, camera.Position.y, camera.Position.z,
+              camera.Rotation.x, camera.Rotation.y, camera.Rotation.z);
+    js += camBuf;
+    // Model debug
+    char modelBuf[256];
+    sprintf_s(modelBuf,
+              ",\"model\":{\"pos\":[%.2f,%.2f,%.2f],\"rot\":[%.2f,%.2f,%.2f],\"scale\":%.2f,\"fov\":%.1f}",
+              g_modelPosition.x, g_modelPosition.y, g_modelPosition.z,
+              g_modelRotation.x, g_modelRotation.y, g_modelRotation.z,
+              g_modelScale, g_modelFov);
+    js += modelBuf;
+    // Cubes
+    js += ",\"cubes\":[";
+    for (size_t i = 0; i < g_myApps.size(); ++i) {
+        if (i) js += ",";
+        char buf[512];
+        const auto& c = g_myApps[i];
+        sprintf_s(buf, "{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"selected\":%s}",
+                  (int)i, Json::Escape(c.AppName).c_str(), Json::Escape(WcsToUtf8(c.AppPath)).c_str(),
+                  c.Position.x, c.Position.y, c.Position.z,
+                  c.IsSelected ? "true" : "false");
+        js += buf;
+    }
+    js += "]";
+    // Virtual desktop
+    char dbuf[64];
+    sprintf_s(dbuf, ",\"desktop\":%d,\"desktopCount\":%zu", g_activeDesktopIndex, g_desktopSlots.size());
+    js += dbuf;
+    // Folder context
+    js += ",\"folder\":";
+    if (g_isInFolder) {
+        std::string folderName = g_folderStack.empty() ? "" : (g_folderStack.back().folderPath.empty()
+            ? "" : WcsToUtf8(g_folderStack.back().folderPath));
+        char fbuf[512];
+        sprintf_s(fbuf, "{\"active\":true,\"depth\":%zu,\"path\":\"%s\",\"maximized\":%s}",
+                  g_folderStack.size(), Json::Escape(folderName).c_str(),
+                  g_isFolderMaximized ? "true" : "false");
+        js += fbuf;
+    } else {
+        js += "{\"active\":false}";
+    }
+    // Windows (hijacked)
+    js += ",\"windows\":[";
+    bool firstW = true;
+    for (const auto& w : g_hijackedWindows) {
+        if (!IsWindow(w.hwnd)) continue;
+        DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
+        std::wstring path = GetProcessPath(pid);
+        WCHAR title[256]; GetWindowTextW(w.hwnd, title, 256);
+        char wbuf[512];
+        sprintf_s(wbuf, "%s{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
+                  firstW ? "" : ",", w.hwnd, pid, Json::Escape(WcsToUtf8(path)).c_str(),
+                  Json::Escape(WcsToUtf8(title)).c_str());
+        js += wbuf;
+        firstW = false;
+    }
+    js += "]";
+    // Running (non-hijacked) windows: system-wide window snapshot
+    js += ",\"running\":[";
+    std::vector<RunningWindow> rw = EnumerateRunningWindows(g_mainHwnd);
+    bool firstR = true;
+    for (const auto& win : rw) {
+        if (firstR) firstR = false; else js += ",";
+        char rbuf[512];
+        sprintf_s(rbuf, "{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
+                  win.hwnd, win.pid, Json::Escape(WcsToUtf8(win.path)).c_str(),
+                  Json::Escape(WcsToUtf8(win.title)).c_str());
+        js += rbuf;
+    }
+    js += "]}";
+
+    std::lock_guard<std::mutex> lock(AIServer::g_reqMutex);
+    AIServer::g_sharedStateJson = js;
+}
+
+static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
+    std::string action = Json::GetStringField(actionJson, "action");
+    AIServer::g_actionResult = "{\"ok\":false,\"error\":\"unknown action\"}";
+
+    if (action == "launch") {
+        std::string path = Json::GetStringField(actionJson, "path");
+        if (!path.empty()) {
+            std::wstring wpath(path.begin(), path.end());
+            LaunchAppByPath(wpath.c_str());
+            AIServer::g_actionResult = "{\"ok\":true,\"action\":\"launch\",\"path\":\"" + Json::Escape(path) + "\"}";
+        } else {
+            // Launch by index
+            size_t idx = (size_t)atoi(Json::GetStringField(actionJson, "index").c_str());
+            if (idx < g_myApps.size()) {
+                LaunchAppByPath(g_myApps[idx].AppPath.c_str());
+                AIServer::g_actionResult = "{\"ok\":true,\"action\":\"launch\",\"index\":" + std::to_string(idx) + "}";
+            }
+        }
+    }
+    else if (action == "switch_desktop") {
+        int idx = atoi(Json::GetStringField(actionJson, "index").c_str());
+        if (idx >= 0 && idx < (int)g_desktopSlots.size()) {
+            SwitchToDesktop(idx);
+            AIServer::g_actionResult = "{\"ok\":true,\"action\":\"switch_desktop\",\"index\":" + std::to_string(idx) + "}";
+        }
+    }
+    else if (action == "create_desktop") {
+        CreateNewDesktop();
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"create_desktop\"}";
+    }
+    else if (action == "close_desktop") {
+        int idx = atoi(Json::GetStringField(actionJson, "index").c_str());
+        if (idx >= 0 && idx < (int)g_desktopSlots.size()) {
+            CloseDesktop(idx);
+            AIServer::g_actionResult = "{\"ok\":true,\"action\":\"close_desktop\",\"index\":" + std::to_string(idx) + "}";
+        }
+    }
+    else if (action == "open_folder") {
+        std::string path = Json::GetStringField(actionJson, "path");
+        if (!path.empty()) {
+            std::wstring wpath(path.begin(), path.end());
+            if (IsPathDirectory(wpath)) {
+                EnterFolder(wpath, camera);
+                AIServer::g_actionResult = "{\"ok\":true,\"action\":\"open_folder\",\"path\":\"" + Json::Escape(path) + "\"}";
+            }
+        } else {
+            size_t idx = (size_t)atoi(Json::GetStringField(actionJson, "index").c_str());
+            if (idx < g_myApps.size() && IsPathDirectory(g_myApps[idx].AppPath)) {
+                EnterFolder(g_myApps[idx].AppPath, camera);
+                AIServer::g_actionResult = "{\"ok\":true,\"action\":\"open_folder\",\"index\":" + std::to_string(idx) + "}";
+            }
+        }
+    }
+    else if (action == "exit_folder") {
+        ExitFolderToRoot(camera);
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"exit_folder\"}";
+    }
+    else if (action == "focus_window") {
+        std::string hwndStr = Json::GetStringField(actionJson, "hwnd");
+        if (!hwndStr.empty()) {
+            HWND h = (HWND)(intptr_t)_strtoui64(hwndStr.c_str(), nullptr, 16);
+            if (IsWindow(h)) { SetForegroundWindow(h); AIServer::g_actionResult = "{\"ok\":true}"; }
+        }
+    }
+    else if (action == "deselect_all") {
+        for (auto& a : g_myApps) a.IsSelected = false;
+        AIServer::g_actionResult = "{\"ok\":true}";
+    }
+    else if (action == "delete_selected") {
+        for (int i = (int)g_myApps.size() - 1; i >= 0; --i) {
+            if (g_myApps[i].IsSelected) {
+                if (g_myApps[i].IconTexture) g_myApps[i].IconTexture->Release();
+                g_myApps.erase(g_myApps.begin() + i);
+            }
+        }
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"delete_selected\"}";
+    }
+    else if (action == "select") {
+        size_t idx = (size_t)atoi(Json::GetStringField(actionJson, "index").c_str());
+        if (idx < g_myApps.size()) {
+            for (auto& a : g_myApps) a.IsSelected = false;
+            g_myApps[idx].IsSelected = true;
+            AIServer::g_actionResult = "{\"ok\":true,\"index\":" + std::to_string(idx) + "}";
+        }
+    }
+    else if (action == "ping") {
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"ping\",\"reply\":\"pong\"}";
+    }
+    else if (action == "quit") {
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"quit\"}";
+        PostMessageW(g_mainHwnd, WM_CLOSE, 0, 0);
+    }
+    else if (action == "reload_apps") {
+        for (auto& app : g_myApps) {
+            if (app.IconTexture) { app.IconTexture->Release(); app.IconTexture = nullptr; }
+        }
+        g_myApps.clear();
+        ScanDesktopForApps(g_myApps);
+        LoadDesktopState(g_myApps);
+        LoadIconsForApps(g_myApps);
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"reload_apps\",\"count\":" + std::to_string(g_myApps.size()) + "}";
+    }
+    else if (action == "toggle_mode") {
+        // Flip 3D/2D UI unlock state (mirrors toggleUiUnlock)
+        g_uiUnlocked = !g_uiUnlocked;
+        if (g_uiUnlocked) {
+            while (ShowCursor(TRUE) < 0);
+            ClipCursor(NULL);
+        } else {
+            while (ShowCursor(FALSE) >= 0);
+            RECT rect; GetClientRect(g_mainHwnd, &rect);
+            MapWindowPoints(g_mainHwnd, nullptr, (POINT*)&rect, 2);
+            ClipCursor(&rect);
+            SetCursorPos(rect.left + (rect.right - rect.left) / 2, rect.top + (rect.bottom - rect.top) / 2);
+        }
+        AIServer::g_actionResult = std::string("{\"ok\":true,\"action\":\"toggle_mode\",\"uiUnlocked\":") +
+            (g_uiUnlocked ? "true" : "false") + "}";
+    }
+    else if (action == "set_camera") {
+        std::string px = Json::GetStringField(actionJson, "px");
+        std::string py = Json::GetStringField(actionJson, "py");
+        std::string pz = Json::GetStringField(actionJson, "pz");
+        std::string rx = Json::GetStringField(actionJson, "rx");
+        std::string ry = Json::GetStringField(actionJson, "ry");
+        std::string rz = Json::GetStringField(actionJson, "rz");
+        if (!px.empty()) camera.Position.x = (float)atof(px.c_str());
+        if (!py.empty()) camera.Position.y = (float)atof(py.c_str());
+        if (!pz.empty()) camera.Position.z = (float)atof(pz.c_str());
+        if (!rx.empty()) camera.Rotation.x = (float)atof(rx.c_str());
+        if (!ry.empty()) camera.Rotation.y = (float)atof(ry.c_str());
+        if (!rz.empty()) camera.Rotation.z = (float)atof(rz.c_str());
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"set_camera\"}";
+    }
+    else if (action == "set_model") {
+        std::string sx = Json::GetStringField(actionJson, "px");
+        std::string sy = Json::GetStringField(actionJson, "py");
+        std::string sz = Json::GetStringField(actionJson, "pz");
+        std::string sc = Json::GetStringField(actionJson, "scale");
+        std::string fov = Json::GetStringField(actionJson, "fov");
+        if (!sx.empty()) g_modelPosition.x = (float)atof(sx.c_str());
+        if (!sy.empty()) g_modelPosition.y = (float)atof(sy.c_str());
+        if (!sz.empty()) g_modelPosition.z = (float)atof(sz.c_str());
+        if (!sc.empty()) g_modelScale = (float)atof(sc.c_str());
+        if (!fov.empty()) g_modelFov = (float)atof(fov.c_str());
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"set_model\"}";
+    }
+    else if (action == "reset_model") {
+        g_modelPosition = DirectX::XMFLOAT3(-2.45f, -2.15f, 9.3f);
+        g_modelRotation = DirectX::XMFLOAT3(-0.1f, 1.0f, -0.11f);
+        g_modelScale = 10.0f;
+        g_modelMatParams = DirectX::XMFLOAT4(0.5f, 1.0f, 0.0f, 0.1f);
+        g_modelColorTint = DirectX::XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"reset_model\"}";
+    }
+    else if (action == "set_volume") {
+        std::string v = Json::GetStringField(actionJson, "level");
+        if (!v.empty() && g_audioEndpoint) {
+            float lvl = (float)atof(v.c_str());
+            if (lvl < 0.0f) lvl = 0.0f;
+            if (lvl > 1.0f) lvl = 1.0f;
+            g_audioEndpoint->SetMasterVolumeLevelScalar(lvl, nullptr);
+            AIServer::g_actionResult = "{\"ok\":true,\"action\":\"set_volume\",\"level\":" + std::to_string(lvl) + "}";
+        }
+    }
+    else if (action == "get_log") {
+        const std::string& logPath = Logger::Instance().GetCurrentLogPath();
+        std::string grepFilter = Json::GetField(actionJson, "grep");
+        std::string countStr = Json::GetField(actionJson, "count");
+        int maxLines = countStr.empty() ? 200 : atoi(countStr.c_str());
+        if (maxLines < 1) maxLines = 200;
+        if (maxLines > 2000) maxLines = 2000;
+        std::string result = "{\"ok\":true,\"logs\":[";
+        FILE* f = nullptr;
+        if (!logPath.empty() && (fopen_s(&f, logPath.c_str(), "r") == 0) && f) {
+            std::vector<std::string> lines;
+            char line[2048];
+            while (fgets(line, sizeof(line), f)) {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+                if (!grepFilter.empty() && s.find(grepFilter) == std::string::npos) continue;
+                lines.push_back(s);
+            }
+            fclose(f);
+            size_t start = (lines.size() > (size_t)maxLines) ? lines.size() - maxLines : 0;
+            bool first = true;
+            for (size_t i = start; i < lines.size(); ++i) {
+                if (!first) result += ",";
+                result += "\"" + Json::Escape(lines[i]) + "\"";
+                first = false;
+            }
+        }
+        result += "]}";
+        AIServer::g_actionResult = result;
+    }
+    else if (action == "describe_scene") {
+        // Build a natural-language description of the current desktop state
+        std::string d = "CrossDim 当前状态：";
+        d += (g_currentState == STATE_2D_WORKBENCH) ? "处于二维工作台模式" : "处于三维探索模式";
+        d += "，uiUnlocked=" + std::string(g_uiUnlocked ? "是" : "否");
+        d += "，当前虚拟桌面 " + std::to_string(g_activeDesktopIndex) + "（共 " + std::to_string(g_desktopSlots.size()) + " 个）";
+        d += "，FPS ≈ " + std::to_string((int)g_fpsCurrent) + "。";
+        if (g_isInFolder) {
+            d += "正在文件夹传送门中：";
+            std::string fpath = g_folderStack.empty() ? "" : WcsToUtf8(g_folderStack.back().folderPath);
+            d += "路径[" + fpath + "]，深度 " + std::to_string(g_folderStack.size());
+            d += g_isFolderMaximized ? "，窗口最大化模式" : "，窗口化模式（可拖动）";
+            d += "。文件夹内含 " + std::to_string(g_folderCubes.size()) + " 个方块。";
+        } else {
+            d += "当前在桌面层，无文件夹传送门开启。";
+        }
+        d += "桌面上有 " + std::to_string(g_myApps.size()) + " 个 3D 方块；";
+        int selCount = 0;
+        for (const auto& a : g_myApps) if (a.IsSelected) selCount++;
+        if (selCount > 0) d += "其中 " + std::to_string(selCount) + " 个被选中。";
+        else d += "当前无选中方块。";
+        d += "劫持窗口 " + std::to_string(g_hijackedWindows.size()) + " 个：";
+        if (!g_hijackedWindows.empty()) {
+            int wIdx = 0;
+            for (const auto& w : g_hijackedWindows) {
+                if (!IsWindow(w.hwnd)) continue;
+                WCHAR title[256]; GetWindowTextW(w.hwnd, title, 256);
+                std::string t = WcsToUtf8(title);
+                if (t.size() > 30) t = t.substr(0, 30) + "...";
+                d += " [" + std::string(t.empty() ? "未命名" : t) + "]";
+                if (++wIdx >= 5) { d += " 等"; break; }
+            }
+        }
+        std::string result = "{\"ok\":true,\"scene\":\"" + Json::Escape(d) + "\"}";
+        AIServer::g_actionResult = result;
+    }
+}
+
+// Capture current backbuffer as a BMP, base64-encode into JSON.
+static void CaptureScreenshot() {
+    if (!g_pSwapChain || !g_pd3dDeviceContext || g_aiFrameW < 1 || g_aiFrameH < 1) {
+        LOG("[screenshot] FAIL no device swap=%d ctx=%d fw=%d", g_pSwapChain!=nullptr, g_pd3dDeviceContext!=nullptr, g_aiFrameW);
+        AIServer::g_screenshotResult = "{\"error\":\"no device\"}";
+        AIServer::g_screenshotReady.store(true);
+        return;
+    }
+    ID3D11Texture2D* pBack = nullptr;
+    HRESULT hrBuf = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBack));
+    if (FAILED(hrBuf) || !pBack) {
+        LOG("[screenshot] FAIL get buffer hr=0x%08x", hrBuf);
+        AIServer::g_screenshotResult = "{\"error\":\"get buffer failed\"}";
+        AIServer::g_screenshotReady.store(true);
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc = {};
+    pBack->GetDesc(&desc);
+    desc.SampleDesc.Count = 1;   // resolve target / staging can't be multisampled
+    desc.SampleDesc.Quality = 0;
+    // If backbuffer was multisampled, resolve to a non-MSAA target first.
+    ID3D11Texture2D* pResolve = nullptr;
+    if (desc.SampleDesc.Count == 1) {
+        desc.BindFlags = 0;
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.Usage = D3D11_USAGE_STAGING;
+    } else {
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        desc.CPUAccessFlags = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.MiscFlags = 0;
+        if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pResolve)) || !pResolve) {
+            pBack->Release();
+            LOG("[screenshot] FAIL resolve target create");
+            AIServer::g_screenshotResult = "{\"error\":\"resolve target create failed\"}";
+            AIServer::g_screenshotReady.store(true);
+            return;
+        }
+        g_pd3dDeviceContext->ResolveSubresource(pResolve, 0, pBack, 0, desc.Format);
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.Usage = D3D11_USAGE_STAGING;
+    }
+    ID3D11Texture2D* pStaging = nullptr;
+    HRESULT hrStg = g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pStaging);
+    if (FAILED(hrStg) || !pStaging) {
+        pBack->Release();
+        LOG("[screenshot] FAIL staging hr=0x%08x w=%u h=%u", hrStg, desc.Width, desc.Height);
+        AIServer::g_screenshotResult = "{\"error\":\"staging create failed\"}";
+        AIServer::g_screenshotReady.store(true);
+        return;
+    }
+    g_pd3dDeviceContext->CopyResource(pStaging, pResolve ? pResolve : pBack);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hrMap = g_pd3dDeviceContext->Map(pStaging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (SUCCEEDED(hrMap)) {
+        int srcW = desc.Width, srcH = desc.Height;
+        int maxDim = AIServer::g_screenshotMaxDim.load();
+        // Compute downscale factor
+        int w = srcW, h = srcH;
+        if (maxDim > 0) {
+            int longEdge = (srcW > srcH) ? srcW : srcH;
+            if (longEdge > maxDim) {
+                w = srcW * maxDim / longEdge;
+                h = srcH * maxDim / longEdge;
+                if (w < 1) w = 1; if (h < 1) h = 1;
+            }
+        }
+        int rowBytes = w * 3;  // 24-bit BGR, no padding for BMP row (usually multiple of 4; add padding if needed)
+        // BMP rows must be multiple of 4 bytes
+        int rowPadded = ((rowBytes + 3) / 4) * 4;
+        int fileSize = 54 + rowPadded * h;
+        std::vector<unsigned char> bmp(fileSize, 0);
+        // File header
+        bmp[0] = 'B'; bmp[1] = 'M';
+        bmp[2] = (unsigned char)(fileSize); bmp[3] = (unsigned char)(fileSize >> 8);
+        bmp[4] = (unsigned char)(fileSize >> 16); bmp[5] = (unsigned char)(fileSize >> 24);
+        bmp[10] = 54;
+        // DIB header
+        bmp[14] = 40;
+        *(int*)&bmp[18] = w;            // width
+        *(int*)&bmp[22] = h;            // height
+        *(short*)&bmp[26] = 1;          // planes
+        *(short*)&bmp[28] = 24;         // bpp
+        *(int*)&bmp[34] = rowPadded * h; // raw size
+        // Pixel data (bottom-up, BGRA→BGR, optional box downscale)
+        const unsigned char* src = (const unsigned char*)mapped.pData;
+        for (int y = 0; y < h; ++y) {
+            unsigned char* dst = &bmp[54 + y * rowPadded];
+            for (int x = 0; x < w; ++x) {
+                int sx, sy;
+                if (w == srcW && h == srcH) {
+                    sx = x; sy = y;
+                } else {
+                    // nearest-neighbor sampling
+                    sx = x * srcW / w;
+                    sy = y * srcH / h;
+                }
+                int srcRow = (srcH - 1 - sy) * mapped.RowPitch;
+                const unsigned char* px = &src[srcRow + sx * 4];
+                dst[x*3+0] = px[0]; // B
+                dst[x*3+1] = px[1]; // G
+                dst[x*3+2] = px[2]; // R
+            }
+        }
+        g_pd3dDeviceContext->Unmap(pStaging, 0);
+
+        bool rawMode = AIServer::g_screenshotRawMode.load();
+        if (rawMode) {
+            // Raw binary BMP: give uint8 bytes to HTTP thread
+            AIServer::g_screenshotRaw.assign((const char*)bmp.data(), bmp.size());
+            AIServer::g_screenshotRawMime = "image/bmp";
+        } else {
+            // Base64 encode
+            static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string enc;
+            enc.reserve((fileSize / 3 + 1) * 4);
+            for (int i = 0; i < fileSize; i += 3) {
+                unsigned char b0 = bmp[i];
+                unsigned char b1 = (i+1 < fileSize) ? bmp[i+1] : 0;
+                unsigned char b2 = (i+2 < fileSize) ? bmp[i+2] : 0;
+                enc += b64[b0 >> 2];
+                enc += b64[((b0 & 3) << 4) | (b1 >> 4)];
+                enc += (i+1 < fileSize) ? b64[((b1 & 15) << 2) | (b2 >> 6)] : '=';
+                enc += (i+2 < fileSize) ? b64[b2 & 63] : '=';
+            }
+            AIServer::g_screenshotResult = "{\"width\":" + std::to_string(w) +
+                ",\"height\":" + std::to_string(h) +
+                ",\"format\":\"bmp\",\"size\":" + std::to_string(fileSize) +
+                ",\"data\":\"" + enc + "\"}";
+        }
+    } else {
+        LOG("[screenshot] FAIL map hr=0x%08x", hrMap);
+        AIServer::g_screenshotResult = "{\"error\":\"map failed\"}";
+    }
+    pStaging->Release();
+    if (pResolve) pResolve->Release();
+    pBack->Release();
+    AIServer::g_screenshotReady.store(true);
+}
+
 // Model debug transform (for imported OBJ)
 DirectX::XMFLOAT3 g_modelPosition = { -2.45f, -2.15f, 9.3f }; // position in world space
 // Rotation order used by UI and XMMatrixRotationRollPitchYaw: (pitch, yaw, roll)
@@ -426,6 +908,7 @@ static void LaunchAppByPath(LPCWSTR appPath) {
             g_currentState = STATE_2D_WORKBENCH;
             while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
             SetSystemTaskbarVisible(false);
+            AIServer::EmitEvent("launch", "{\"path\":\"" + Json::Escape(WcsToUtf8(std::wstring(appPath))) + "\"}");
         }
     } else {
         HINSTANCE result = ShellExecuteW(NULL, L"open", appPath, NULL, NULL, SW_SHOWNORMAL);
@@ -795,6 +1278,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
     RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_NOREPEAT, VK_TAB);
     Logger::Instance().Init();
+    // AI Control Interface: HTTP server on background thread.
+    // The notify callback posts a message to wake the render loop quickly.
+    AIServer::SetNotifyMain([]() {
+        if (g_mainHwnd) PostMessageW(g_mainHwnd, WM_APP + 1, 0, 0);
+    });
+    AIServer::Start();
     SetSystemTaskbarVisible(false);
     DragAcceptFiles(hwnd, TRUE);
     RAWINPUTDEVICE rid[1];
@@ -988,7 +1477,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                     for (const auto& win : g_hijackedWindows) {
                         if (win.hwnd == target) { exists = true; break; }
                     }
-                    if (!exists) g_hijackedWindows.push_back({ target });
+                    if (!exists) {
+                        g_hijackedWindows.push_back({ target });
+                        WCHAR wtitle[256]; GetWindowTextW(target, wtitle, 256);
+                        char hbuf[32];
+                        sprintf_s(hbuf, "0x%p", target);
+                        AIServer::EmitEvent("window_open", std::string("{\"hwnd\":\"") + hbuf + "\",\"title\":\"" +
+                                             Json::Escape(WcsToUtf8(wtitle)) + "\"}");
+                    }
 
                     it = g_pendingHijacks.erase(it);
                     continue;
@@ -2410,6 +2906,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         camera.Update();
         RECT clientRect;
         GetClientRect(hwnd, &clientRect);
+        g_aiFrameW = clientRect.right - clientRect.left;
+        g_aiFrameH = clientRect.bottom - clientRect.top;
         float width = (float)(clientRect.right - clientRect.left);
         float height = (float)(clientRect.bottom - clientRect.top);
         if (width <= 0) width = 1.0f;
@@ -3092,6 +3590,60 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
 
+        // AI Control Interface: process pending HTTP requests (main thread)
+        {
+            // Publish state snapshot (throttled to ~10 Hz)
+            static LARGE_INTEGER s_aiFreq = {};
+            static LARGE_INTEGER s_aiLast = {};
+            if (s_aiFreq.QuadPart == 0) {
+                QueryPerformanceFrequency(&s_aiFreq);
+                QueryPerformanceCounter(&s_aiLast);
+            }
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if ((now.QuadPart - s_aiLast.QuadPart) * 1000 / s_aiFreq.QuadPart > 100) {
+                s_aiLast = now;
+                BuildStateSnapshot(camera);
+            }
+
+            // Handle action requests
+            if (AIServer::g_actionPending.load()) {
+                std::string actionJson;
+                {
+                    std::lock_guard<std::mutex> lock(AIServer::g_reqMutex);
+                    actionJson = AIServer::g_pendingAction;
+                    AIServer::g_actionPending.store(false);
+                }
+                if (!actionJson.empty()) {
+                    LOG("[ai] action: %s", actionJson.c_str());
+                    ExecuteAIAction(actionJson, camera);
+                    // Optional: auto-attach screenshot to action result for one-shot debug
+                    std::string wantShot = Json::GetField(actionJson, "screenshot");
+                    if (wantShot == "1" || wantShot == "true") {
+                        AIServer::g_screenshotRawMode.store(false);
+                        CaptureScreenshot();
+                        std::string shotData;
+                        {
+                            std::lock_guard<std::mutex> lock(AIServer::g_reqMutex);
+                            shotData = AIServer::g_screenshotResult.empty() ? "" : AIServer::g_screenshotResult;
+                            AIServer::g_screenshotResult.clear();
+                            AIServer::g_screenshotReady.store(false);
+                        }
+                        if (!shotData.empty() && AIServer::g_actionResult.size() > 2) {
+                            AIServer::g_actionResult.pop_back(); // drop final '}'
+                            AIServer::g_actionResult += ",\"screenshot\":" + shotData + "}";
+                        }
+                    }
+                }
+                AIServer::g_actionResultReady.store(true);
+            }
+
+            // Handle screenshot request
+            if (AIServer::g_screenshotRequested.load()) {
+                AIServer::g_screenshotRequested.store(false);
+                CaptureScreenshot();
+            }
+        }
+
         g_leftClicked = false;
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -3112,6 +3664,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     UnregisterHotKey(hwnd, 3);
     UnregisterHotKey(hwnd, 4);
     UnregisterHotKey(hwnd, 5);
+    AIServer::Stop();
     if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
     if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
     SetSystemTaskbarVisible(true);

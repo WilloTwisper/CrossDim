@@ -204,6 +204,37 @@ chore: unify logs to logs/ dir + auto-prune v0.0.7
 - **Version bumps**: PATCH for fixes/refactors, MINOR for new features, MAJOR for shell-mode switch
 - **Multi-commit versions**: append `-rc1`, `-rc2` etc. before the final tag
 
+## AI Control Interface (local HTTP/JSON)
+CrossDim runs a local HTTP server (`127.0.0.1:52317`, override with `CROSSDIM_PORT`) so AI agents can observe and control it in real time. Use this to **see the actual state and screenshots** instead of guessing from code.
+
+```bash
+# See live state (cubes, windows, camera, mode, fps)
+curl http://127.0.0.1:52317/api/state
+
+# See the current frame (downscaled, saves tokens)
+curl "http://127.0.0.1:52317/api/screenshot?scale=240" | jq -r .data | base64 -d > f.bmp
+
+# Raw binary BMP (no base64, easiest to save directly)
+curl -o frame.bmp "http://127.0.0.1:52317/api/screenshot?raw=1&scale=240"
+
+# Discover all available actions
+curl http://127.0.0.1:52317/api/help
+
+# Read the event stream (incremental perception of desktop changes)
+curl "http://127.0.0.1:52317/api/events?since=0"          # all buffered events
+curl "http://127.0.0.1:52317/api/events?since=123&wait=2000"  # long-poll for new events
+
+# Execute an action (POST JSON body)
+curl -X POST -d '{"action":"launch","index":0}' http://127.0.0.1:52317/api/action
+curl -X POST -d '{"action":"switch_desktop","index":1}' http://127.0.0.1:52317/api/action
+curl -X POST -d '{"action":"open_folder","path":"C:\\Users\\me\\Docs"}' http://127.0.0.1:52317/api/action
+curl -X POST -d '{"action":"get_log"}' http://127.0.0.1:52317/api/action
+```
+
+**Actions**: `ping`, `launch`, `switch_desktop`, `create_desktop`, `close_desktop`, `open_folder`, `exit_folder`, `focus_window`, `select`, `deselect_all`, `delete_selected`, `reload_apps`, `toggle_mode`, `set_camera`, `set_model`, `reset_model`, `set_volume`, `get_log`. Screenshot returns BMP (base64) — decodable by most tools.
+
+**Architecture**: HTTP thread runs on a background thread; all state reads/actions are dispatched to the main render thread periodically (state snapshot ~10Hz, actions/screenshots on-demand). Never touch `g_myApps`/`g_hijackedWindows` from the HTTP thread directly. Events are emitted synchronously at state-change sites (window/folder/desktop/launch) into a ring buffer (max 500), polled via `/api/events?since=N`.
+
 ## Strict Rules
 ### 1. Never block the main thread
 Win32 API polling, model loading, and any I/O must use async patterns — state machines (e.g. `frameWait` counters) or `std::thread`. The render loop runs every frame; stalling it freezes the entire desktop shell.
