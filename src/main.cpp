@@ -857,7 +857,16 @@ static void CaptureScreenshot() {
         *(short*)&bmp[26] = 1;          // planes
         *(short*)&bmp[28] = 24;         // bpp
         *(int*)&bmp[34] = rowPadded * h; // raw size
-        // Pixel data (bottom-up, BGRA→BGR, optional box downscale)
+        // Pixel data (bottom-up, optional downscale). BMP stores BGR triplets;
+        // source channel order depends on the backbuffer format.
+        const bool srcBGRA = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                              desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                              desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+                              desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+                              desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB ||
+                              desc.Format == DXGI_FORMAT_B8G8R8X8_TYPELESS);
+        const int iB = srcBGRA ? 0 : 2; // index of Blue within a 4-byte pixel
+        const int iR = srcBGRA ? 2 : 0; // index of Red
         const unsigned char* src = (const unsigned char*)mapped.pData;
         for (int y = 0; y < h; ++y) {
             unsigned char* dst = &bmp[54 + y * rowPadded];
@@ -872,9 +881,9 @@ static void CaptureScreenshot() {
                 }
                 int srcRow = (srcH - 1 - sy) * mapped.RowPitch;
                 const unsigned char* px = &src[srcRow + sx * 4];
-                dst[x*3+0] = px[0]; // B
-                dst[x*3+1] = px[1]; // G
-                dst[x*3+2] = px[2]; // R
+                dst[x*3+0] = px[iB]; // B
+                dst[x*3+1] = px[1];  // G
+                dst[x*3+2] = px[iR]; // R
             }
         }
         g_pd3dDeviceContext->Unmap(pStaging, 0);
