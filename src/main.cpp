@@ -114,6 +114,30 @@ float g_dragDistance = 8.0f;
 static int g_activeDesktopIndex = 0;
 static std::vector<int> g_desktopSlots;
 static int g_nextDesktopId = 1;
+// Per-desktop-id tombstones: paths the user removed; kept out of future scans
+static std::unordered_map<int, std::vector<std::wstring>> g_desktopRemovedPaths;
+
+static int DesktopIdAt(int slotIdx) {
+    if (slotIdx < 0 || slotIdx >= (int)g_desktopSlots.size()) return 0;
+    return g_desktopSlots[slotIdx];
+}
+static int ActiveDesktopId() { return DesktopIdAt(g_activeDesktopIndex); }
+
+// Resolve a runtime asset path: try CWD first, then exe dir, then exe dir's
+// parent (covers running from build\ with assets in the project root).
+static std::wstring ResolveRuntimePathW(const wchar_t* rel) {
+    if (GetFileAttributesW(rel) != INVALID_FILE_ATTRIBUTES) return rel;
+    WCHAR exeDir[MAX_PATH];
+    GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
+    WCHAR* s = wcsrchr(exeDir, L'\\');
+    if (!s) return rel;
+    *s = L'\0';
+    std::wstring p = std::wstring(exeDir) + L"\\" + rel;
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    p = std::wstring(exeDir) + L"\\..\\" + rel;
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    return rel;
+}
 static int g_targetDesktopIndex = -1;
 static float g_desktopTransition = 0.0f;
 static const float g_desktopTransitionSpeed = 4.0f;
@@ -125,7 +149,7 @@ static int GetDesktopSlotCount() { return (int)g_desktopSlots.size(); }
 static void SwitchToDesktop(int slotIdx) {
     if (slotIdx == g_activeDesktopIndex || slotIdx < 0 || slotIdx >= (int)g_desktopSlots.size()) return;
     if (g_targetDesktopIndex >= 0) return;
-    SaveDesktopState(g_myApps, g_activeDesktopIndex);
+    SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     // Hide all windows on current desktop
     for (const auto& w : g_hijackedWindows) {
         ShowWindow(w.hwnd, SW_HIDE);
@@ -146,7 +170,7 @@ static void CompleteDesktopSwitch() {
         if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
     }
     ScanDesktopForApps(g_myApps);
-    LoadDesktopState(g_myApps, g_targetDesktopIndex);
+    LoadDesktopState(g_myApps, DesktopIdAt(g_targetDesktopIndex), &g_desktopRemovedPaths[DesktopIdAt(g_targetDesktopIndex)]);
     LoadIconsForApps(g_myApps);
     g_activeDesktopIndex = g_targetDesktopIndex;
     g_targetDesktopIndex = -1;
@@ -157,7 +181,7 @@ static void CompleteDesktopSwitch() {
 static void CreateNewDesktop() {
     int newId = g_nextDesktopId++;
     g_desktopSlots.push_back(newId);
-    SaveDesktopState(g_myApps, g_activeDesktopIndex);
+    SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     // Hide current desktop's windows and save to cache
     for (const auto& w : g_hijackedWindows) {
         ShowWindow(w.hwnd, SW_HIDE);
@@ -172,7 +196,7 @@ static void CreateNewDesktop() {
     }
     g_myApps.clear();
     ScanDesktopForApps(g_myApps);
-    LoadDesktopState(g_myApps, g_activeDesktopIndex);
+    LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     LoadIconsForApps(g_myApps);
     AIServer::EmitEvent("desktop_create", "{\"index\":" + std::to_string(g_activeDesktopIndex) + "}");
 }
@@ -182,8 +206,10 @@ static void CloseDesktop(int slotIdx) {
     if (g_targetDesktopIndex >= 0) return;
     int closingId = g_desktopSlots[slotIdx];
     wchar_t fname[64];
-    swprintf_s(fname, L"desktop_%d.cddesk", closingId);
+    if (closingId == 0) wcscpy_s(fname, L"desktop.cddesk");
+    else swprintf_s(fname, L"desktop_%d.cddesk", closingId);
     DeleteFileW(fname);
+    g_desktopRemovedPaths.erase(closingId);
     int removeSlot = slotIdx;
     if (slotIdx == g_activeDesktopIndex) {
         for (auto& app : g_myApps) {
@@ -205,7 +231,7 @@ static void CloseDesktop(int slotIdx) {
             if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
         }
         ScanDesktopForApps(g_myApps);
-        LoadDesktopState(g_myApps, g_activeDesktopIndex);
+        LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
         LoadIconsForApps(g_myApps);
     } else {
         g_desktopSlots.erase(g_desktopSlots.begin() + removeSlot);
@@ -274,7 +300,7 @@ static void EnterFolder(const std::wstring& path, Camera& camera) {
     FolderState fs;
     std::wstring fn = path; size_t sl = fn.rfind(L'\\');
     if (sl != std::wstring::npos) fn = fn.substr(sl + 1);
-    for (wchar_t ch : fn) fs.displayName += (char)ch;
+    fs.displayName = WcsToUtf8(fn); // breadcrumb is UTF-8; byte truncation garbles CJK
     fs.folderPath = path;
     fs.cubes = newCubes;
     for (auto& c : fs.cubes) c.IconTexture = nullptr;
@@ -502,7 +528,7 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
     if (action == "launch") {
         std::string path = Json::GetStringField(actionJson, "path");
         if (!path.empty()) {
-            std::wstring wpath(path.begin(), path.end());
+            std::wstring wpath = Utf8ToWcs(path); // JSON is UTF-8; byte-widening breaks CJK
             LaunchAppByPath(wpath.c_str());
             AIServer::g_actionResult = "{\"ok\":true,\"action\":\"launch\",\"path\":\"" + Json::Escape(path) + "\"}";
         } else {
@@ -535,7 +561,7 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
     else if (action == "open_folder") {
         std::string path = Json::GetStringField(actionJson, "path");
         if (!path.empty()) {
-            std::wstring wpath(path.begin(), path.end());
+            std::wstring wpath = Utf8ToWcs(path); // JSON is UTF-8; byte-widening breaks CJK
             if (IsPathDirectory(wpath)) {
                 EnterFolder(wpath, camera);
                 AIServer::g_actionResult = "{\"ok\":true,\"action\":\"open_folder\",\"path\":\"" + Json::Escape(path) + "\"}";
@@ -564,13 +590,18 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
         AIServer::g_actionResult = "{\"ok\":true}";
     }
     else if (action == "delete_selected") {
+        int removed = 0;
         for (int i = (int)g_myApps.size() - 1; i >= 0; --i) {
             if (g_myApps[i].IsSelected) {
                 if (g_myApps[i].IconTexture) g_myApps[i].IconTexture->Release();
+                g_desktopRemovedPaths[ActiveDesktopId()].push_back(g_myApps[i].AppPath);
                 g_myApps.erase(g_myApps.begin() + i);
+                removed++;
             }
         }
-        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"delete_selected\"}";
+        if (removed > 0 && !(g_isInFolder && g_isFolderMaximized))
+            SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
+        AIServer::g_actionResult = "{\"ok\":true,\"action\":\"delete_selected\",\"removed\":" + std::to_string(removed) + "}";
     }
     else if (action == "select") {
         size_t idx = (size_t)atoi(Json::GetStringField(actionJson, "index").c_str());
@@ -593,7 +624,7 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
         }
         g_myApps.clear();
         ScanDesktopForApps(g_myApps);
-        LoadDesktopState(g_myApps);
+        LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
         LoadIconsForApps(g_myApps);
         AIServer::g_actionResult = "{\"ok\":true,\"action\":\"reload_apps\",\"count\":" + std::to_string(g_myApps.size()) + "}";
     }
@@ -614,12 +645,17 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
             (g_uiUnlocked ? "true" : "false") + "}";
     }
     else if (action == "set_camera") {
+        // Rotation is (pitch, yaw, roll) in radians; accept both rx/ry/rz and
+        // the more intuitive pitch/yaw/roll field names.
         std::string px = Json::GetStringField(actionJson, "px");
         std::string py = Json::GetStringField(actionJson, "py");
         std::string pz = Json::GetStringField(actionJson, "pz");
         std::string rx = Json::GetStringField(actionJson, "rx");
         std::string ry = Json::GetStringField(actionJson, "ry");
         std::string rz = Json::GetStringField(actionJson, "rz");
+        if (rx.empty()) rx = Json::GetStringField(actionJson, "pitch");
+        if (ry.empty()) ry = Json::GetStringField(actionJson, "yaw");
+        if (rz.empty()) rz = Json::GetStringField(actionJson, "roll");
         if (!px.empty()) camera.Position.x = (float)atof(px.c_str());
         if (!py.empty()) camera.Position.y = (float)atof(py.c_str());
         if (!pz.empty()) camera.Position.z = (float)atof(pz.c_str());
@@ -667,8 +703,12 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
         if (maxLines < 1) maxLines = 200;
         if (maxLines > 2000) maxLines = 2000;
         std::string result = "{\"ok\":true,\"logs\":[";
-        FILE* f = nullptr;
-        if (!logPath.empty() && (fopen_s(&f, logPath.c_str(), "r") == 0) && f) {
+        // NOTE: use plain fopen here — fopen_s opens the handle non-shareable,
+        // which fails (EACCES) because the Logger already holds this file open.
+        FILE* f = logPath.empty() ? nullptr : fopen(logPath.c_str(), "r");
+        errno_t openErr = f ? 0 : (logPath.empty() ? ENOENT : errno);
+        size_t lineCount = 0;
+        if (openErr == 0 && f) {
             std::vector<std::string> lines;
             char line[2048];
             while (fgets(line, sizeof(line), f)) {
@@ -678,6 +718,7 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
                 lines.push_back(s);
             }
             fclose(f);
+            lineCount = lines.size();
             size_t start = (lines.size() > (size_t)maxLines) ? lines.size() - maxLines : 0;
             bool first = true;
             for (size_t i = start; i < lines.size(); ++i) {
@@ -686,7 +727,9 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
                 first = false;
             }
         }
-        result += "]}";
+        result += "],\"path\":\"" + Json::Escape(logPath) +
+            "\",\"openErr\":" + std::to_string((int)openErr) +
+            ",\"lineCount\":" + std::to_string(lineCount) + "}";
         AIServer::g_actionResult = result;
     }
     else if (action == "describe_scene") {
@@ -745,21 +788,17 @@ static void CaptureScreenshot() {
     }
     D3D11_TEXTURE2D_DESC desc = {};
     pBack->GetDesc(&desc);
-    desc.SampleDesc.Count = 1;   // resolve target / staging can't be multisampled
-    desc.SampleDesc.Quality = 0;
-    // If backbuffer was multisampled, resolve to a non-MSAA target first.
+    // If the backbuffer is multisampled, resolve to a non-MSAA target first
+    // (must check the ORIGINAL desc before zeroing SampleDesc).
     ID3D11Texture2D* pResolve = nullptr;
-    if (desc.SampleDesc.Count == 1) {
-        desc.BindFlags = 0;
-        desc.MiscFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        desc.Usage = D3D11_USAGE_STAGING;
-    } else {
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-        desc.CPUAccessFlags = 0;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.MiscFlags = 0;
-        if (FAILED(g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pResolve)) || !pResolve) {
+    if (desc.SampleDesc.Count > 1) {
+        D3D11_TEXTURE2D_DESC rd = desc;
+        rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0;
+        rd.BindFlags = D3D11_BIND_RENDER_TARGET;
+        rd.CPUAccessFlags = 0;
+        rd.Usage = D3D11_USAGE_DEFAULT;
+        rd.MiscFlags = 0;
+        if (FAILED(g_pd3dDevice->CreateTexture2D(&rd, nullptr, &pResolve)) || !pResolve) {
             pBack->Release();
             LOG("[screenshot] FAIL resolve target create");
             AIServer::g_screenshotResult = "{\"error\":\"resolve target create failed\"}";
@@ -767,10 +806,14 @@ static void CaptureScreenshot() {
             return;
         }
         g_pd3dDeviceContext->ResolveSubresource(pResolve, 0, pBack, 0, desc.Format);
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        desc.Usage = D3D11_USAGE_STAGING;
     }
+    // Staging texture (never multisampled)
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.BindFlags = 0;
+    desc.MiscFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.Usage = D3D11_USAGE_STAGING;
     ID3D11Texture2D* pStaging = nullptr;
     HRESULT hrStg = g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pStaging);
     if (FAILED(hrStg) || !pStaging) {
@@ -974,6 +1017,82 @@ void CleanupDevice() {
 }
 
 
+// ---- Low-level keyboard routing -------------------------------------------
+// RegisterHotKey(VK_TAB) used to swallow Tab system-wide. The low-level hook
+// lets us decide per press: plain Tab toggles 3D/2D only when CrossDim itself
+// is foreground; Ctrl+Tab drives the window switcher when the shell (or a
+// hijacked window) is foreground; everything else passes through untouched.
+#define WM_APP_CD_TOGGLE   (WM_APP + 1)
+#define WM_APP_CD_SWITCHNEXT (WM_APP + 2)
+#define WM_APP_CD_SWITCHCONFIRM (WM_APP + 3)
+#define WM_APP_CD_SWITCHCANCEL (WM_APP + 4)
+
+static HHOOK g_keyboardHook = nullptr;
+
+static void OpenOrAdvanceWindowSwitcher() {
+    if (!g_showWindowSwitcher) {
+        g_switcherWindows.clear();
+        for (const auto& w : g_hijackedWindows) {
+            if (IsWindow(w.hwnd) && IsWindowVisible(w.hwnd)) {
+                DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
+                g_switcherWindows.push_back({ w.hwnd, GetProcessPath(pid) });
+            }
+        }
+        if (!g_switcherWindows.empty()) {
+            g_showWindowSwitcher = true;
+            g_switcherSelected = 0;
+        }
+    } else {
+        int n = (int)g_switcherWindows.size();
+        if (n > 0) g_switcherSelected = (g_switcherSelected + 1) % n;
+    }
+}
+
+static void ConfirmWindowSwitcher() {
+    if (!g_showWindowSwitcher) return;
+    if (g_switcherSelected >= 0 && g_switcherSelected < (int)g_switcherWindows.size()) {
+        SetForegroundWindow(g_switcherWindows[g_switcherSelected].first);
+    }
+    g_showWindowSwitcher = false;
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_mainHwnd) {
+        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+        bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+        if (kb->vkCode == VK_TAB && down) {
+            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
+            if (!win) { // never touch Win+Tab / Alt+Tab system combos
+                HWND fg = GetForegroundWindow();
+                bool shellFg = (fg == g_mainHwnd);
+                if (!shellFg) {
+                    for (const auto& w : g_hijackedWindows) {
+                        if (w.hwnd == fg) { shellFg = true; break; }
+                    }
+                }
+                if (ctrl && !alt && !shift) {
+                    if (shellFg) { PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHNEXT, 0, 0); return 1; }
+                } else if (!ctrl && !alt && !shift) {
+                    if (fg == g_mainHwnd) { PostMessageW(g_mainHwnd, WM_APP_CD_TOGGLE, 0, 0); return 1; }
+                }
+            }
+        }
+        if (g_showWindowSwitcher) {
+            if (kb->vkCode == VK_CONTROL && up) {
+                PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHCONFIRM, 0, 0); // pass-through: apps still see the keyup
+            } else if (kb->vkCode == VK_ESCAPE && down) {
+                PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHCANCEL, 0, 0);
+                return 1; // switcher is modal while open
+            }
+        }
+    }
+    return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto toggleUiUnlock = [&](HWND hwnd) {
         g_uiUnlocked = !g_uiUnlocked;
@@ -1027,21 +1146,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     if (msg == WM_HOTKEY && wParam == 5) {
-        if (!g_showWindowSwitcher) {
-            g_switcherWindows.clear();
-            for (const auto& w : g_hijackedWindows) {
-                if (IsWindow(w.hwnd) && IsWindowVisible(w.hwnd)) {
-                    DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
-                    g_switcherWindows.push_back({ w.hwnd, GetProcessPath(pid) });
-                }
-            }
-            if (!g_switcherWindows.empty()) {
-                g_showWindowSwitcher = true;
-                g_switcherSelected = 0;
-            }
-        }
+        OpenOrAdvanceWindowSwitcher(); // fallback path (only if hook install failed)
         return 0;
     }
+    // Hook-driven requests (delivered on our thread via PostMessage)
+    if (msg == WM_APP_CD_TOGGLE) { toggleUiUnlock(hWnd); return 0; }
+    if (msg == WM_APP_CD_SWITCHNEXT) { OpenOrAdvanceWindowSwitcher(); return 0; }
+    if (msg == WM_APP_CD_SWITCHCONFIRM) { ConfirmWindowSwitcher(); return 0; }
+    if (msg == WM_APP_CD_SWITCHCANCEL) { g_showWindowSwitcher = false; return 0; }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
         toggleUiUnlock(hWnd);
         return 0;
@@ -1101,8 +1213,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (slash != std::wstring::npos) fname = fname.substr(slash + 1);
                 size_t dot = fname.rfind(L'.');
                 std::wstring nameOnly = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
-                std::string label;
-                for (wchar_t ch : nameOnly) label += (char)ch;
+                std::string label = WcsToUtf8(nameOnly);
 
                 AppCube cube = {};
                 cube.Position = DirectX::XMFLOAT3(0.0f, 1.5f, 8.0f);
@@ -1117,6 +1228,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
                 g_myApps.push_back(cube);
+                // Re-adding a previously removed path clears its tombstone
+                {
+                    auto& tombs = g_desktopRemovedPaths[ActiveDesktopId()];
+                    tombs.erase(std::remove(tombs.begin(), tombs.end(), fpath), tombs.end());
+                }
+                SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
                 LOGW(L"[drop] Added: %s", fpath.c_str());
             }
             DragFinish(hDrop);
@@ -1185,7 +1302,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_rightClicked = false;
             return 0;
         }
-        case WM_KEYDOWN:
+        case WM_KEYDOWN: {
             if (g_showWindowSwitcher) {
                 if (wParam == VK_TAB) {
                     int n = (int)g_switcherWindows.size();
@@ -1196,8 +1313,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             if (wParam == VK_CONTROL) g_ctrlHeld = true;
-            if (wParam == VK_ESCAPE) PostQuitMessage(0);
-            if (g_ctrlHeld && (GetKeyState(VK_MENU) & 0x8000)) {
+            const bool imguiKbFocus = ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard;
+            if (wParam == VK_ESCAPE && !imguiKbFocus) PostQuitMessage(0);
+            if (g_ctrlHeld && (GetKeyState(VK_MENU) & 0x8000) && !imguiKbFocus) {
                 int slotCount = GetDesktopSlotCount();
                 if (wParam >= '1' && wParam <= '0' + slotCount) {
                     SwitchToDesktop((int)(wParam - '1'));
@@ -1236,13 +1354,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             return 0;
+        }
 
         case WM_KEYUP:
             if (g_showWindowSwitcher && wParam == VK_CONTROL) {
-                if (g_switcherSelected >= 0 && g_switcherSelected < (int)g_switcherWindows.size()) {
-                    SetForegroundWindow(g_switcherWindows[g_switcherSelected].first);
-                }
-                g_showWindowSwitcher = false;
+                ConfirmWindowSwitcher();
                 return 0;
             }
             if (wParam == VK_CONTROL) g_ctrlHeld = false;
@@ -1254,6 +1370,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+    // Anchor CWD to the exe directory: assets, logs and .cddesk persistence all
+    // use relative paths and must not depend on how the process was launched.
+    {
+        WCHAR exePath[MAX_PATH];
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        WCHAR* slash = wcsrchr(exePath, L'\\');
+        if (slash) { *slash = L'\0'; SetCurrentDirectoryW(exePath); }
+    }
+
     HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool comUninit = (comInit == S_OK || comInit == S_FALSE);
     bool comCanUse = (comInit == S_OK || comInit == S_FALSE || comInit == RPC_E_CHANGED_MODE);
@@ -1272,11 +1397,20 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                                 0, 0, screenW, screenH, 
                                 nullptr, nullptr, wc.hInstance, nullptr);
     g_mainHwnd = hwnd;
-    g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
+    // Tab / Ctrl+Tab go through the low-level hook so they only fire in shell
+    // context. Global hotkeys remain as a fallback if the hook can't install.
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
+    if (g_keyboardHook) {
+        g_tabHotkeyRegistered = true; // routing handled by the hook
+        LOG("[input] low-level keyboard hook installed (Tab/Ctrl+Tab are context-sensitive)");
+    } else {
+        LOG("[input] WH_KEYBOARD_LL failed, falling back to global hotkeys");
+        g_tabHotkeyRegistered = (RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_TAB) != 0);
+        RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_NOREPEAT, VK_TAB);
+    }
     RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_ESCAPE);
     RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'D');
     RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
-    RegisterHotKey(hwnd, 5, MOD_CONTROL | MOD_NOREPEAT, VK_TAB);
     Logger::Instance().Init();
     // AI Control Interface: HTTP server on background thread.
     // The notify callback posts a message to wake the render loop quickly.
@@ -1343,10 +1477,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (!skybox.Initialize(g_pd3dDevice)) OutputDebugStringW(L"Skybox initialization failed!\n");
     if (!modelRenderer.Initialize(g_pd3dDevice)) OutputDebugStringW(L"ModelRenderer initialization failed!\n");
 
-    modelRenderer.LoadModelAsync("assets/bloom_high/bloom_high.obj");
+    modelRenderer.LoadModelAsync(WcsToUtf8(ResolveRuntimePathW(L"assets\\bloom_high\\bloom_high.obj")));
     
     ScanDesktopForApps(g_myApps);
-    LoadDesktopState(g_myApps);
+    LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     LoadIconsForApps(g_myApps);
     g_desktopSlots = { 0 };
     g_desktopWindows = { {} };
@@ -1464,6 +1598,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 LONG style = GetWindowLong(target, GWL_STYLE);
                 if ((style & WS_CAPTION) == WS_CAPTION) {
                     OutputDebugStringW(L"[成功] 捕获到目标弹出的窗口！实施扒衣！\n");
+                    LONG originalStyle = style; // captured for restoration on exit
                     style &= ~(WS_CAPTION | WS_SYSMENU);
                     style |= WS_THICKFRAME;
                     SetWindowLong(target, GWL_STYLE, style);
@@ -1478,7 +1613,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                         if (win.hwnd == target) { exists = true; break; }
                     }
                     if (!exists) {
-                        g_hijackedWindows.push_back({ target });
+                        HijackedWindow hw = {}; hw.hwnd = target; hw.originalStyle = originalStyle;
+                        g_hijackedWindows.push_back(hw);
                         WCHAR wtitle[256]; GetWindowTextW(target, wtitle, 256);
                         char hbuf[32];
                         sprintf_s(hbuf, "0x%p", target);
@@ -1651,29 +1787,59 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 entry.Pid = 0;
             }
 
-            std::vector<RunningWindow> runningWindows = EnumerateRunningWindows(g_mainHwnd);
-            for (const auto& win : runningWindows) {
-                if (g_taskbarDynamicOrder.find(win.hwnd) == g_taskbarDynamicOrder.end()) {
-                    g_taskbarDynamicOrder[win.hwnd] = g_taskbarDynamicOrderCounter++;
+            // Expensive Win32/COM queries are throttled to ~2 Hz. Per-frame full
+            // window enumeration (with OpenProcess per window) used to cost
+            // several ms of frame time and was the main FPS tax.
+            static std::vector<RunningWindow> s_runningWindowsCache;
+            static std::unordered_map<std::wstring, HWND> s_pinnedFallbackHwnd;
+            static NetworkStatus s_netStatus = {};
+            static float s_volumeLevel = 0.5f;
+            static bool s_imeOpen = false, s_imeChinese = false;
+            static SYSTEM_POWER_STATUS s_power = {};
+            static DWORD s_lastSysTick = 0;
+            DWORD nowTick = GetTickCount();
+            bool slowTick = (nowTick - s_lastSysTick > 500);
+            if (slowTick) {
+                s_lastSysTick = nowTick;
+                s_runningWindowsCache = EnumerateRunningWindows(g_mainHwnd);
+                for (const auto& win : s_runningWindowsCache) {
+                    if (g_taskbarDynamicOrder.find(win.hwnd) == g_taskbarDynamicOrder.end()) {
+                        g_taskbarDynamicOrder[win.hwnd] = g_taskbarDynamicOrderCounter++;
+                    }
                 }
-            }
-            for (auto it = g_taskbarDynamicOrder.begin(); it != g_taskbarDynamicOrder.end(); ) {
-                bool alive = false;
-                for (const auto& win : runningWindows) {
-                    if (win.hwnd == it->first) { alive = true; break; }
+                for (auto it = g_taskbarDynamicOrder.begin(); it != g_taskbarDynamicOrder.end(); ) {
+                    bool alive = false;
+                    for (const auto& win : s_runningWindowsCache) {
+                        if (win.hwnd == it->first) { alive = true; break; }
+                    }
+                    if (!alive) it = g_taskbarDynamicOrder.erase(it);
+                    else ++it;
                 }
-                if (!alive) it = g_taskbarDynamicOrder.erase(it);
-                else ++it;
+                std::sort(s_runningWindowsCache.begin(), s_runningWindowsCache.end(), [&](const RunningWindow& a, const RunningWindow& b) {
+                    int orderA = 0;
+                    int orderB = 0;
+                    auto itA = g_taskbarDynamicOrder.find(a.hwnd);
+                    auto itB = g_taskbarDynamicOrder.find(b.hwnd);
+                    if (itA != g_taskbarDynamicOrder.end()) orderA = itA->second;
+                    if (itB != g_taskbarDynamicOrder.end()) orderB = itB->second;
+                    return orderA < orderB;
+                });
+                // Fallback scan for windows the main enum misses (previous frame's
+                // Running flag tells us which pinned apps need the second chance)
+                for (auto& pinned : taskbarPinned) {
+                    if (pinned.IconKind == TASKBAR_ICON_APP && !pinned.AppPath.empty() && !pinned.Running) {
+                        HWND found = FindRunningHwnd(pinned.AppPath);
+                        if (found) s_pinnedFallbackHwnd[pinned.AppPath] = found;
+                        else s_pinnedFallbackHwnd.erase(pinned.AppPath);
+                    }
+                }
+                s_netStatus = GetNetworkStatus();
+                s_volumeLevel = GetMasterVolumeLevelScalar();
+                s_imeOpen = GetImeOpenStatus(hwnd);
+                s_imeChinese = IsChineseImeLayout();
+                GetSystemPowerStatus(&s_power);
             }
-            std::sort(runningWindows.begin(), runningWindows.end(), [&](const RunningWindow& a, const RunningWindow& b) {
-                int orderA = 0;
-                int orderB = 0;
-                auto itA = g_taskbarDynamicOrder.find(a.hwnd);
-                auto itB = g_taskbarDynamicOrder.find(b.hwnd);
-                if (itA != g_taskbarDynamicOrder.end()) orderA = itA->second;
-                if (itB != g_taskbarDynamicOrder.end()) orderB = itB->second;
-                return orderA < orderB;
-            });
+            const std::vector<RunningWindow>& runningWindows = s_runningWindowsCache;
             HWND fgWindow = GetForegroundWindow();
             for (auto& pinned : taskbarPinned) {
                 if (pinned.IconKind == TASKBAR_ICON_APP) {
@@ -1717,10 +1883,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
             for (auto& pinned : taskbarPinned) {
                 if (pinned.IconKind == TASKBAR_ICON_APP && !pinned.Running) {
-                    HWND found = FindRunningHwnd(pinned.AppPath);
-                    if (found) {
+                    auto fb = s_pinnedFallbackHwnd.find(pinned.AppPath);
+                    if (fb != s_pinnedFallbackHwnd.end() && IsWindow(fb->second)) {
                         pinned.Running = true;
-                        pinned.Hwnd = found;
+                        pinned.Hwnd = fb->second;
                     }
                 }
             }
@@ -1746,23 +1912,19 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             sprintf_s(timeText, "%02u:%02u", st.wHour, st.wMinute);
             sprintf_s(dateText, "%04u/%02u/%02u", st.wYear, st.wMonth, st.wDay);
 
-            bool imeOpen = GetImeOpenStatus(hwnd);
-            bool imeChinese = IsChineseImeLayout();
+            bool imeOpen = s_imeOpen;
+            bool imeChinese = s_imeChinese;
             const char* imeLeft = imeChinese ? (imeOpen ? "中" : "英") : "";
             const char* imeRight = imeChinese ? "拼" : "ENG";
-            NetworkStatus netStatus = GetNetworkStatus();
-            bool netConnected = netStatus.connected;
-            bool netWifi = netStatus.wifi || !netStatus.ethernet;
-            float volumeLevel = GetMasterVolumeLevelScalar();
+            bool netConnected = s_netStatus.connected;
+            bool netWifi = s_netStatus.wifi || !s_netStatus.ethernet;
+            float volumeLevel = s_volumeLevel;
             int batteryPercent = 100;
             bool batteryCharging = false;
-            SYSTEM_POWER_STATUS power = {};
-            if (GetSystemPowerStatus(&power)) {
-                if (power.BatteryLifePercent != 255) {
-                    batteryPercent = (int)power.BatteryLifePercent;
-                }
-                batteryCharging = (power.ACLineStatus == 1);
+            if (s_power.BatteryLifePercent != 255) {
+                batteryPercent = (int)s_power.BatteryLifePercent;
             }
+            batteryCharging = (s_power.ACLineStatus == 1);
 
             ImVec2 timeSize = ImGui::CalcTextSize(timeText);
             ImVec2 dateSize = ImGui::CalcTextSize(dateText);
@@ -2874,7 +3036,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 }
                 g_myApps.clear();
                 ScanDesktopForApps(g_myApps);
-                LoadDesktopState(g_myApps);
+                LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
                 LoadIconsForApps(g_myApps);
             }
             ImGui::End();
@@ -3282,7 +3444,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             bool wasDragging = g_isDragging || g_isBlankDragging;
             g_grabbedAppIndex = -1; g_isDragging = false; g_isBlankDragging = false;
             g_dropTargetIndex = -1;
-            if (!g_isFolderMaximized) SaveDesktopState(g_myApps, g_activeDesktopIndex);
+            // g_myApps is the desktop unless we're inside a maximized folder
+            if (wasDragging && !(g_isInFolder && g_isFolderMaximized))
+                SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
         }
         } // !mouseInPortal
 
@@ -3527,8 +3691,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 }
                 if (ImGui::MenuItem("Remove")) {
                     if (g_myApps[idx].IconTexture) g_myApps[idx].IconTexture->Release();
+                    // Tombstone the path so the next desktop scan won't resurrect it
+                    g_desktopRemovedPaths[ActiveDesktopId()].push_back(g_myApps[idx].AppPath);
                     g_myApps.erase(g_myApps.begin() + idx);
-            if (!g_isFolderMaximized) SaveDesktopState(g_myApps, g_activeDesktopIndex);
+                    if (!(g_isInFolder && g_isFolderMaximized))
+                        SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
                     g_rightClickedCubeIndex = -1;
                 }
             }
@@ -3591,6 +3758,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         }
 
         // AI Control Interface: process pending HTTP requests (main thread)
+        static bool aiActionShotPending = false; // deferred action-attached screenshot
         {
             // Publish state snapshot (throttled to ~10 Hz)
             static LARGE_INTEGER s_aiFreq = {};
@@ -3616,37 +3784,46 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 if (!actionJson.empty()) {
                     LOG("[ai] action: %s", actionJson.c_str());
                     ExecuteAIAction(actionJson, camera);
-                    // Optional: auto-attach screenshot to action result for one-shot debug
+                    // Optional: auto-attach screenshot to action result (deferred
+                    // until after ImGui render so the 2D UI layer is included)
                     std::string wantShot = Json::GetField(actionJson, "screenshot");
                     if (wantShot == "1" || wantShot == "true") {
-                        AIServer::g_screenshotRawMode.store(false);
-                        CaptureScreenshot();
-                        std::string shotData;
-                        {
-                            std::lock_guard<std::mutex> lock(AIServer::g_reqMutex);
-                            shotData = AIServer::g_screenshotResult.empty() ? "" : AIServer::g_screenshotResult;
-                            AIServer::g_screenshotResult.clear();
-                            AIServer::g_screenshotReady.store(false);
-                        }
-                        if (!shotData.empty() && AIServer::g_actionResult.size() > 2) {
-                            AIServer::g_actionResult.pop_back(); // drop final '}'
-                            AIServer::g_actionResult += ",\"screenshot\":" + shotData + "}";
-                        }
+                        aiActionShotPending = true;
                     }
                 }
-                AIServer::g_actionResultReady.store(true);
-            }
-
-            // Handle screenshot request
-            if (AIServer::g_screenshotRequested.load()) {
-                AIServer::g_screenshotRequested.store(false);
-                CaptureScreenshot();
+                if (!aiActionShotPending)
+                    AIServer::g_actionResultReady.store(true);
             }
         }
 
         g_leftClicked = false;
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        // AI screenshots: capture after ImGui render (2D UI visible), before Present
+        // (back buffer still valid).
+        if (aiActionShotPending) {
+            aiActionShotPending = false;
+            AIServer::g_screenshotRawMode.store(false);
+            CaptureScreenshot();
+            std::string shotData;
+            {
+                std::lock_guard<std::mutex> lock(AIServer::g_reqMutex);
+                shotData = AIServer::g_screenshotResult;
+                AIServer::g_screenshotResult.clear();
+                AIServer::g_screenshotReady.store(false);
+            }
+            if (!shotData.empty() && AIServer::g_actionResult.size() > 2) {
+                AIServer::g_actionResult.pop_back(); // drop final '}'
+                AIServer::g_actionResult += ",\"screenshot\":" + shotData + "}";
+            }
+            AIServer::g_actionResultReady.store(true);
+        }
+        if (AIServer::g_screenshotRequested.load()) {
+            AIServer::g_screenshotRequested.store(false);
+            CaptureScreenshot();
+        }
+
         g_pSwapChain->Present(1, 0);
     }
 
@@ -3657,21 +3834,41 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (comUninit) {
         CoUninitialize();
     }
-    if (g_tabHotkeyRegistered) {
+    if (g_keyboardHook) {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    } else if (g_tabHotkeyRegistered) {
         UnregisterHotKey(hwnd, 1);
+        UnregisterHotKey(hwnd, 5);
     }
     UnregisterHotKey(hwnd, 2);
     UnregisterHotKey(hwnd, 3);
     UnregisterHotKey(hwnd, 4);
-    UnregisterHotKey(hwnd, 5);
     AIServer::Stop();
     if (g_hShutdownEvent) { SetEvent(g_hShutdownEvent); CloseHandle(g_hShutdownEvent); g_hShutdownEvent = nullptr; }
     if (g_hHeartbeatEvent) { CloseHandle(g_hHeartbeatEvent); g_hHeartbeatEvent = nullptr; }
+    // Restore every hijacked/hidden window before leaving (reversibility, rule #5)
+    auto restoreHijackedWindows = [](const std::vector<HijackedWindow>& wins) {
+        for (const auto& w : wins) {
+            if (!IsWindow(w.hwnd)) continue;
+            if (w.originalStyle) {
+                SetWindowLong(w.hwnd, GWL_STYLE, w.originalStyle);
+                SetWindowPos(w.hwnd, nullptr, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            }
+            ShowWindow(w.hwnd, SW_SHOW);
+        }
+    };
+    restoreHijackedWindows(g_hijackedWindows);
+    for (const auto& desktopWins : g_desktopWindows) restoreHijackedWindows(desktopWins);
     SetSystemTaskbarVisible(true);
-    if (g_isFolderMaximized) {
-        SaveDesktopState(g_desktopBackupCubes, g_activeDesktopIndex);
+    // Persist the DESKTOP cube layout. In a maximized folder g_myApps holds the
+    // folder's content and the real desktop lives in g_desktopBackupCubes;
+    // in every other mode g_myApps is the desktop.
+    if (g_isInFolder && g_isFolderMaximized) {
+        SaveDesktopState(g_desktopBackupCubes, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     } else {
-        SaveDesktopState(g_myApps, g_activeDesktopIndex);
+        SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     }
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);

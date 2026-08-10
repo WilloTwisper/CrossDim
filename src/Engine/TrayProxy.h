@@ -22,6 +22,15 @@ static HWND FindTrayToolbar() {
     return FindWindowExW(hPager, nullptr, L"ToolbarWindow32", nullptr);
 }
 
+// Explorer's toolbar lives in another process: if Explorer hangs, a bare
+// SendMessage would freeze the whole shell. All cross-process toolbar
+// messages go through this timeout wrapper.
+static LRESULT TraySendMessage(HWND hToolbar, UINT msg, WPARAM w, LPARAM l, DWORD timeoutMs = 150) {
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(hToolbar, msg, w, l, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, &result);
+    return (LRESULT)result;
+}
+
 static std::vector<TrayIconEntry> QueryTrayIcons() {
     std::vector<TrayIconEntry> result;
     HWND hToolbar = FindTrayToolbar();
@@ -34,7 +43,7 @@ static std::vector<TrayIconEntry> QueryTrayIcons() {
     HANDLE hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, pid);
     if (!hProc) return result;
 
-    int btnCount = (int)SendMessageW(hToolbar, TB_BUTTONCOUNT, 0, 0);
+    int btnCount = (int)TraySendMessage(hToolbar, TB_BUTTONCOUNT, 0, 0);
     if (btnCount <= 0 || btnCount > 64) { CloseHandle(hProc); return result; }
 
     for (int i = 0; i < btnCount; i++) {
@@ -43,7 +52,7 @@ static std::vector<TrayIconEntry> QueryTrayIcons() {
 
         TBBUTTON tb = {};
         WriteProcessMemory(hProc, remoteTb, &tb, sizeof(tb), nullptr);
-        LRESULT btnOk = SendMessageW(hToolbar, TB_GETBUTTON, (WPARAM)i, (LPARAM)remoteTb);
+        LRESULT btnOk = TraySendMessage(hToolbar, TB_GETBUTTON, (WPARAM)i, (LPARAM)remoteTb);
 
         TBBUTTON btn;
         BOOL readOk = ReadProcessMemory(hProc, remoteTb, &btn, sizeof(btn), nullptr);
@@ -57,7 +66,7 @@ static std::vector<TrayIconEntry> QueryTrayIcons() {
 
         void* remoteText = VirtualAllocEx(hProc, nullptr, 256 * sizeof(WCHAR), MEM_COMMIT, PAGE_READWRITE);
         if (remoteText) {
-            SendMessageW(hToolbar, TB_GETBUTTONTEXTW, (WPARAM)btn.idCommand, (LPARAM)remoteText);
+            TraySendMessage(hToolbar, TB_GETBUTTONTEXTW, (WPARAM)btn.idCommand, (LPARAM)remoteText);
             WCHAR localText[256] = {};
             size_t readBytes = 0;
             ReadProcessMemory(hProc, remoteText, localText, sizeof(localText) - sizeof(WCHAR), &readBytes);

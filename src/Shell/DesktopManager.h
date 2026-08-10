@@ -53,6 +53,15 @@ static std::string WcsToUtf8(const std::wstring& wstr) {
     return result;
 }
 
+static std::wstring Utf8ToWcs(const std::string& str) {
+    if (str.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring result(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], len);
+    return result;
+}
+
 static bool SearchMatch(const char* searchFilter, const std::string& label, const std::wstring& path) {
     if (!searchFilter || searchFilter[0] == '\0') return true;
     std::string filter(searchFilter);
@@ -60,8 +69,8 @@ static bool SearchMatch(const char* searchFilter, const std::string& label, cons
     std::string lcLabel = label;
     for (auto& c : lcLabel) c = (char)tolower((unsigned char)c);
     if (lcLabel.find(filter) != std::string::npos) return true;
-    std::string lcPath;
-    for (wchar_t ch : path) lcPath += (char)tolower((unsigned char)ch);
+    std::string lcPath = WcsToUtf8(path); // proper wide→UTF-8; byte truncation broke CJK search
+    for (auto& c : lcPath) c = (char)tolower((unsigned char)c);
     if (lcPath.find(filter) != std::string::npos) return true;
     return false;
 }
@@ -206,15 +215,15 @@ static void ScanFolderForApps(const std::wstring& folderPath, std::vector<AppCub
     }
 }
 
-static void SaveDesktopState(const std::vector<AppCube>& apps, int desktopIndex = 0) {
+static void SaveDesktopState(const std::vector<AppCube>& apps, int desktopId = 0, const std::vector<std::wstring>* removedPaths = nullptr) {
     wchar_t fname[64];
-    if (desktopIndex == 0) wcscpy_s(fname, L"desktop.cddesk");
-    else swprintf_s(fname, L"desktop_%d.cddesk", desktopIndex);
+    if (desktopId == 0) wcscpy_s(fname, L"desktop.cddesk");
+    else swprintf_s(fname, L"desktop_%d.cddesk", desktopId);
     HANDLE hFile = CreateFileW(fname, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD written;
     DWORD magic = 0x4B534544;
-    DWORD version = 2;
+    DWORD version = 3;
     DWORD count = (DWORD)apps.size();
     WriteFile(hFile, &magic, sizeof(magic), &written, nullptr);
     WriteFile(hFile, &version, sizeof(version), &written, nullptr);
@@ -228,19 +237,29 @@ static void SaveDesktopState(const std::vector<AppCube>& apps, int desktopIndex 
         WriteFile(hFile, &nameLen, sizeof(nameLen), &written, nullptr);
         WriteFile(hFile, app.AppName.data(), (DWORD)nameLen, &written, nullptr);
     }
+    // v3: tombstone section — paths removed by the user, excluded from future scans
+    DWORD tombCount = removedPaths ? (DWORD)removedPaths->size() : 0;
+    WriteFile(hFile, &tombCount, sizeof(tombCount), &written, nullptr);
+    if (removedPaths) {
+        for (const auto& p : *removedPaths) {
+            WORD pathLen = (WORD)p.size();
+            WriteFile(hFile, &pathLen, sizeof(pathLen), &written, nullptr);
+            WriteFile(hFile, p.data(), (DWORD)(pathLen * sizeof(wchar_t)), &written, nullptr);
+        }
+    }
     CloseHandle(hFile);
 }
 
-static void LoadDesktopState(std::vector<AppCube>& apps, int desktopIndex = 0) {
+static void LoadDesktopState(std::vector<AppCube>& apps, int desktopId = 0, std::vector<std::wstring>* outRemoved = nullptr) {
     wchar_t fname[64];
-    if (desktopIndex == 0) wcscpy_s(fname, L"desktop.cddesk");
-    else swprintf_s(fname, L"desktop_%d.cddesk", desktopIndex);
+    if (desktopId == 0) wcscpy_s(fname, L"desktop.cddesk");
+    else swprintf_s(fname, L"desktop_%d.cddesk", desktopId);
     HANDLE hFile = CreateFileW(fname, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD bytesRead;
     DWORD magic, version, count;
     if (!ReadFile(hFile, &magic, sizeof(magic), &bytesRead, nullptr) || magic != 0x4B534544) { CloseHandle(hFile); return; }
-    if (!ReadFile(hFile, &version, sizeof(version), &bytesRead, nullptr) || version < 1 || version > 2) { CloseHandle(hFile); return; }
+    if (!ReadFile(hFile, &version, sizeof(version), &bytesRead, nullptr) || version < 1 || version > 3) { CloseHandle(hFile); return; }
     if (!ReadFile(hFile, &count, sizeof(count), &bytesRead, nullptr)) { CloseHandle(hFile); return; }
     for (DWORD i = 0; i < count; ++i) {
         WORD pathLen = 0;
@@ -270,7 +289,28 @@ static void LoadDesktopState(std::vector<AppCube>& apps, int desktopIndex = 0) {
             apps.push_back(cube);
         }
     }
+    // v3: tombstone section
+    if (version >= 3 && outRemoved) {
+        outRemoved->clear();
+        DWORD tombCount = 0;
+        if (ReadFile(hFile, &tombCount, sizeof(tombCount), &bytesRead, nullptr) && tombCount <= 4096) {
+            for (DWORD i = 0; i < tombCount; ++i) {
+                WORD pathLen = 0;
+                if (!ReadFile(hFile, &pathLen, sizeof(pathLen), &bytesRead, nullptr)) break;
+                std::wstring p(pathLen, L'\0');
+                if (pathLen > 0 && !ReadFile(hFile, &p[0], (DWORD)(pathLen * sizeof(wchar_t)), &bytesRead, nullptr)) break;
+                outRemoved->push_back(p);
+            }
+        }
+    }
     CloseHandle(hFile);
+    // Prune scanned apps the user previously removed from this desktop
+    if (outRemoved && !outRemoved->empty()) {
+        apps.erase(std::remove_if(apps.begin(), apps.end(), [&](const AppCube& a) {
+            for (const auto& rp : *outRemoved) if (a.AppPath == rp) return true;
+            return false;
+        }), apps.end());
+    }
 }
 
 static void LoadIconsForApps(std::vector<AppCube>& apps) {

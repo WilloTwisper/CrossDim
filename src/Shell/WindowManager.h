@@ -21,6 +21,7 @@ inline std::vector<PendingHijack> g_pendingHijacks;
 
 struct HijackedWindow {
     HWND hwnd;
+    LONG originalStyle = 0; // GWL_STYLE captured before hijack, restored on exit
 };
 inline std::vector<HijackedWindow> g_hijackedWindows;
 
@@ -199,9 +200,16 @@ static void SetSystemTaskbarVisible(bool visible) {
 
 static HICON GetWindowBestIcon(HWND hwnd) {
     if (!hwnd) return nullptr;
-    HICON hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0);
-    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL2, 0);
-    if (!hIcon) hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
+    // SendMessageTimeout: a hung target process must never freeze the shell
+    auto tryGetIcon = [&](WPARAM which) -> HICON {
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(hwnd, WM_GETICON, which, 0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result);
+        return (HICON)result;
+    };
+    HICON hIcon = tryGetIcon(ICON_BIG);
+    if (!hIcon) hIcon = tryGetIcon(ICON_SMALL2);
+    if (!hIcon) hIcon = tryGetIcon(ICON_SMALL);
     if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICON);
     if (!hIcon) hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
     return hIcon;
