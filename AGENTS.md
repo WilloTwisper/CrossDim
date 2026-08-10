@@ -242,7 +242,7 @@ curl -X POST -d '{"action":"open_folder","path":"C:\\Users\\me\\Docs"}' http://1
 curl -X POST -d '{"action":"get_log"}' http://127.0.0.1:52317/api/action
 ```
 
-**Actions**: `ping`, `launch`, `switch_desktop`, `create_desktop`, `close_desktop`, `open_folder`, `exit_folder`, `focus_window`, `select`, `deselect_all`, `delete_selected`, `reload_apps`, `toggle_mode`, `set_camera` (accepts `px/py/pz` + `rx/ry/rz` or `pitch/yaw/roll`), `set_model`, `reset_model`, `set_volume`, `get_log`, `describe_scene`, `quit`. Screenshot returns BMP (base64) — decodable by most tools.
+**Actions**: `ping`, `launch`, `switch_desktop`, `create_desktop`, `close_desktop`, `open_folder`, `exit_folder`, `focus_window`, `select`, `deselect_all`, `delete_selected`, `reload_apps`, `toggle_mode`, `set_camera` (accepts `px/py/pz` + `rx/ry/rz` or `pitch/yaw/roll`; **angles in degrees**, engine convention), `set_model`, `reset_model`, `set_volume`, `get_log`, `describe_scene`, `quit`. Screenshot returns BMP (base64) — decodable by most tools.
 
 **Architecture**: HTTP thread runs on a background thread; all state reads/actions are dispatched to the main render thread periodically (state snapshot ~10Hz, actions/screenshots on-demand). Never touch `g_myApps`/`g_hijackedWindows` from the HTTP thread directly. Events are emitted synchronously at state-change sites (window/folder/desktop/launch) into a ring buffer (max 500), polled via `/api/events?since=N`.
 

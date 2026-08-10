@@ -1478,6 +1478,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     Camera camera;
+    // Default framing mirrors the Win11 Bloom wallpaper composition: flower
+    // right-of-center, cube wall to the left. Rotation is (pitch, yaw, roll)
+    // in DEGREES (engine convention; Camera::Update converts to radians).
+    camera.Rotation = DirectX::XMFLOAT3(-10.0f, 15.0f, 0.0f);
     CubeRenderer cubeRenderer;
     SkyboxRenderer skybox;
     ModelRenderer modelRenderer;
