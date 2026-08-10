@@ -12,14 +12,14 @@
 | Explorer 子系统 | 权重 | 当前覆盖 | 公开 API 上限 | 缺口原因 |
 |---|---|---|---|---|
 | Taskbar + 托盘指示器 | 25% | ~55% | ~85% | 无法宿主第三方 tray 图标（`ITrayNotify` 未公开） |
-| 桌面 / 文件图标 / 拖放 | 20% | ~30% | ~80% | 硬编码 14 个 app cube，无文件系统集成 |
-| 文件管理器 | 25% | 0% | ~75% | 完全未开始 |
-| 窗口管理 + Alt+Tab | 15% | ~35% | ~80% | 能劫持，有边缘吸附和快捷键，缺 Alt+Tab 替换/虚拟桌面 |
+| 桌面 / 文件图标 / 拖放 | 20% | ~45% | ~80% | 桌面扫描 + 位置/删除持久化（v3 墓碑）已有；缺自定义添加 UI、图标仍是贴图拉伸厚度 |
+| 文件管理器 | 25% | ~10% | ~75% | 文件夹传送门原型已通（进入/嵌套/窗口化），缺文件操作与正式管理器 |
+| 窗口管理 + Alt+Tab | 15% | ~55% | ~80% | 劫持/吸附/快捷键 + Ctrl+Tab 3D 切换器 + 虚拟桌面；缺 DWM 缩略图、Win+Tab 视觉 |
 | Start Menu | 5% | ~40% | ~70% | 搜索框是摆设，无动态应用列表 |
 | 通知中心 | 7% | 0% | ~25% | WinRT 通知管道受保护，只能做自建覆盖层 |
 | 系统工具区 | 3% | ~60% | ~80% | 自绘电池/音量/网络/IME，形态已稳定 |
 
-**当前加权覆盖度：~22% / 公开 API 理论上限：~76% / Explorer 降格架构理论上限：~95%**
+**当前加权覆盖度：~30% / 公开 API 理论上限：~76% / Explorer 降格架构理论上限：~95%**
 
 ## Tech Stack
 - **Language:** C++17/20 (MSVC `cl.exe`, `/O2`, `/std:c++17`)
@@ -27,7 +27,7 @@
 ### Compiled source files (`tasks.json` explicit file list)
 | File | Lines | Notes |
 |---|---|---|
-| `src/main.cpp` | 2126 | Entry point. `wWinMain`, state machine, taskbar UI, window chrome, raycasting, drag-drop, model debug |
+| `src/main.cpp` | ~3900 | Entry point. `wWinMain`, state machine, taskbar UI, window chrome, raycasting, drag-drop, folder portal, virtual desktops, AI action dispatch, LL keyboard hook |
 | `src/Engine/Camera.cpp` | 69 | FPS-style camera (rotation only, `Move()` exists but never called) |
 | `src/Engine/SkyboxRenderer.cpp` | 147 | Procedural skybox |
 | `src/Engine/CubeRenderer.cpp` | 251 | 3D icon cubes + spherical sector selection |
@@ -38,12 +38,14 @@
 | `vendor/imgui/backends/imgui_impl_dx11.cpp` | — | DX11 backend |
 
 ### Header-only modules (included by `main.cpp`, not compiled separately)
-- `src/Engine/Logger.h` (129 lines) — header-only singleton, `logs/` dir, auto-prune old logs.
-- `src/Engine/TrayProxy.h` (75 lines) — header-only tray icon query helper.
-- `src/Engine/TextureLoader.h` (212 lines) — header-only texture/icon utilities.
-- `src/Shell/DesktopManager.h` (224 lines) — `AppCube`, desktop scan, persistence, search.
-- `src/Shell/WindowManager.h` (235 lines) — window enumeration, hijack queue, icon cache.
-- `src/Shell/SystemInfo.h` (122 lines) — audio, IME, network status.
+- `src/Engine/Logger.h` (121 lines) — header-only singleton, `logs/` dir, auto-prune old logs.
+- `src/Engine/TrayProxy.h` (69 lines) — tray icon query helper, all cross-process messages via `SendMessageTimeout`.
+- `src/Engine/TextureLoader.h` (171 lines) — texture/icon utilities.
+- `src/Engine/JsonUtils.h` (75 lines) — minimal JSON escape + flat field parser.
+- `src/Shell/AIServer.h` (327 lines) — HTTP/JSON control interface (`127.0.0.1:52317`), background thread, actions marshaled to main thread.
+- `src/Shell/DesktopManager.h` (315 lines) — `AppCube`, desktop scan, `.cddesk` v3 persistence (positions + removal tombstones), search. UTF-8 helpers `WcsToUtf8`/`Utf8ToWcs` live here.
+- `src/Shell/WindowManager.h` (222 lines) — window enumeration, hijack queue, icon cache. `WM_GETICON` uses `SendMessageTimeout` (hung apps must not freeze the shell).
+- `src/Shell/SystemInfo.h` (109 lines) — audio, IME, network status (call sites throttled to ~2 Hz).
 
 ## Architecture
 
@@ -52,7 +54,7 @@ The app toggles between two modes (defined in `main.cpp:38-44`):
 - **`STATE_3D_EXPLORE`** — mouse locked for FPS-style camera, raycast targeting, drag-and-drop of 3D icons, marquee selection.
 - **`STATE_2D_WORKBENCH`** — mouse unlocked, ImGui taskbar and 2D UI interaction, hijacked legacy windows overlaid on the 3D scene.
 
-Toggle between states: `Ctrl+Shift+X` registered as global `MOD_NOREPEAT` hotkey on `VK_TAB` (`main.cpp:733`). In 2D mode, pressing Tab closes all hijacked apps and returns to 3D.
+Toggle between states: plain `Tab`, routed through a low-level `WH_KEYBOARD_LL` hook — it only fires when CrossDim itself is foreground, so other apps keep their Tab key (falls back to a global hotkey if hook install fails). `Ctrl+Tab` opens/cycles the 3D window switcher when the shell or a hijacked window is foreground; releasing Ctrl confirms, ESC cancels. In 2D mode, ESC only quits the shell when ImGui has no keyboard focus.
 
 Auto-return: when all hijacked windows close and no pending hijacks remain, automatically returns from 2D to 3D (`main.cpp:1896-1902`).
 
@@ -117,7 +119,7 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 4. **Tray icon proxy** (~300 lines) — hook into Explorer's tray toolbar to read icon state, render natively in CrossDim's taskbar.
 5. **Startup splash + degraded recovery** — splash window on init; if D3D init fails within 10s, auto-restore Shell registry and launch Explorer.
 
-## Known Issues (all resolved in v0.0.6)
+## Known Issues (1-8 resolved in v0.0.6, 9-17 resolved in v0.1.1)
 
 | # | Issue | Status |
 |---|---|---|
@@ -129,13 +131,22 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | 6 | `ModelRenderer::LoadModel()` dead declaration | Fixed — removed declaration |
 | 7 | `m_pendingNormalPathW` never populated | Fixed — parse `map_Bump`/`bump` from MTL; keep fallback on load failure |
 | 8 | `desktop.cddesk` no read/write code | Resolved — binary save/load implemented, positions persist across sessions |
+| 9 | Graceful exit wiped `desktop.cddesk` (empty `g_desktopBackupCubes` saved when never in folder; `g_isFolderMaximized` inits true) | Fixed v0.1.1 — gate on `g_isInFolder && g_isFolderMaximized` |
+| 10 | Drag/remove never saved in pure desktop mode (gated on `!g_isFolderMaximized`) | Fixed v0.1.1 — gate on folder state; `.cddesk` v3 adds removal tombstones so deleted cubes don't resurrect |
+| 11 | Exit left hijacked windows style-stripped / hidden | Fixed v0.1.1 — original `GWL_STYLE` recorded at hijack, restored on exit (incl. stashed virtual-desktop windows) |
+| 12 | Bare `Tab` global hotkey stole Tab from every app | Fixed v0.1.1 — `WH_KEYBOARD_LL` hook, context-sensitive (see Dual State Machine) |
+| 13 | 3D switcher couldn't cycle (Tab eaten by hotkey; `WM_KEYDOWN` branch dead) | Fixed v0.1.1 — `Ctrl+Tab` open/advance via hook, release-Ctrl confirm, ESC cancel |
+| 14 | Per-frame `EnumWindows` + per-frame network/volume/IME polling (~ms/frame tax) | Fixed v0.1.1 — 2 Hz throttled caches; FPS ~35 → ~50 |
+| 15 | Model/assets CWD-relative paths failed when launched outside project root (Bloom model never loaded from `build\`) | Fixed v0.1.1 — CWD anchored to exe dir + `ResolveRuntimePathW` fallback |
+| 16 | `get_log` always empty (`fopen_s` opens non-shareable → EACCES vs Logger's handle) | Fixed v0.1.1 — plain `fopen` |
+| 17 | AI screenshot all-black (MSAA check after `SampleDesc` overwrite) and missed 2D UI (captured before ImGui render) | Fixed v0.1.1 — proper resolve path + capture after ImGui, before Present |
 
 ## Feature Roadmap
 
 ### Phase 1 — Stability & Foundation (~620 lines, Debug: Med-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | Partial — cube positions save/load via desktop.cddesk ✅. Pinned apps/preferences not persisted |
+| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | ✅ for cubes — positions + removal tombstones via `.cddesk` v3 (per virtual desktop). Pinned apps/preferences still not persisted |
 | 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | ✅ — split into `src/Shell/DesktopManager.h` (224L) / `WindowManager.h` (235L) / `SystemInfo.h` (122L). main.cpp 2612→2126 lines |
 | 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None | ✅ |
 | 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None | ✅ |
@@ -143,7 +154,7 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 ### Phase 2 — Desktop Completeness (~880 lines, Debug: Medium)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | Partial — save/load, Delete key removal, right-click context menu ✅. File picker/Start Menu scan still TODO |
+| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | Partial — save/load, right-click context menu + API removal with tombstone persistence ✅. `VK_DELETE` handler still unwired (`g_deleteRequested` never set). File picker/Start Menu scan still TODO |
 | 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 | ✅ |
 | 2.3 | Camera movement (WASD + scroll zoom, `Camera::Move()` already implemented) | ~100 | Low | None | Removed (excluded from design) |
 | 2.4 | Search engine (hook existing Start Menu search box, substring filter on apps/cubes) | ~160 | Low-Med | 2.1 | ✅ |
@@ -152,8 +163,8 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
 | 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 | ✅ — drag-to-edge half/maximize/quarter, blue preview overlay, Ctrl+Alt+Arrows shortcuts |
-| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | — |
-| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | — |
+| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | ✅ basic — `Ctrl+Tab` 3D card switcher, hold-to-cycle, release confirms; no DWM thumbnails yet |
+| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | ✅ basic — switch/create/close, per-desktop `.cddesk` (ID-named), window stash/restore; multi-desktop state not restored across restarts |
 
 ### Phase 4 — Polish & Enhancement (~445 lines, Debug: Low-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
@@ -231,7 +242,7 @@ curl -X POST -d '{"action":"open_folder","path":"C:\\Users\\me\\Docs"}' http://1
 curl -X POST -d '{"action":"get_log"}' http://127.0.0.1:52317/api/action
 ```
 
-**Actions**: `ping`, `launch`, `switch_desktop`, `create_desktop`, `close_desktop`, `open_folder`, `exit_folder`, `focus_window`, `select`, `deselect_all`, `delete_selected`, `reload_apps`, `toggle_mode`, `set_camera`, `set_model`, `reset_model`, `set_volume`, `get_log`. Screenshot returns BMP (base64) — decodable by most tools.
+**Actions**: `ping`, `launch`, `switch_desktop`, `create_desktop`, `close_desktop`, `open_folder`, `exit_folder`, `focus_window`, `select`, `deselect_all`, `delete_selected`, `reload_apps`, `toggle_mode`, `set_camera` (accepts `px/py/pz` + `rx/ry/rz` or `pitch/yaw/roll`), `set_model`, `reset_model`, `set_volume`, `get_log`, `describe_scene`, `quit`. Screenshot returns BMP (base64) — decodable by most tools.
 
 **Architecture**: HTTP thread runs on a background thread; all state reads/actions are dispatched to the main render thread periodically (state snapshot ~10Hz, actions/screenshots on-demand). Never touch `g_myApps`/`g_hijackedWindows` from the HTTP thread directly. Events are emitted synchronously at state-change sites (window/folder/desktop/launch) into a ring buffer (max 500), polled via `/api/events?since=N`.
 
