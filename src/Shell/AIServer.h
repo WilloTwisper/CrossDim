@@ -22,7 +22,7 @@
 // Endpoints:
 //   GET  /api/state        -> JSON snapshot of cubes, windows, virtual desktops
 //   POST /api/action       -> execute an action: { "action": "...", ... }
-//   GET  /api/screenshot   -> PNG of current frame (base64 in JSON)
+//   GET  /api/screenshot   -> BMP of current frame (base64 JSON, or raw=1 binary)
 //
 // Port: default 52317, override with env CROSSDIM_PORT.
 
@@ -119,14 +119,25 @@ static std::string GetRequestBody(const std::string& reqText) {
     return reqText.substr(pos + 4);
 }
 
+// send() may short-write; loop until the buffer is fully out the door
+static bool SendAll(SOCKET sock, const char* data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sock, data + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
 // Send a full HTTP response
 static void SendHttp(SOCKET sock, int statusCode, const char* statusText,
                      const std::string& body, const std::string& contentType = "application/json") {
     char head[512];
     sprintf_s(head, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
               statusCode, statusText, contentType.c_str(), (unsigned)body.size());
-    send(sock, head, (int)strlen(head), 0);
-    send(sock, body.data(), (int)body.size(), 0);
+    SendAll(sock, head, (int)strlen(head));
+    SendAll(sock, body.data(), (int)body.size());
 }
 
 // Raise an event window-message to the main window so it can process pending actions.
@@ -135,18 +146,44 @@ static void(*g_NotifyMainFn)(void) = nullptr;
 static void SetNotifyMain(void(*fn)(void)) { g_NotifyMainFn = fn; }
 
 static void HandleConnection(SOCKET sock) {
+    // A stuck client must not wedge the (single-threaded) control surface
+    DWORD rcvTimeout = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
+
+    // Read until end of headers (a single recv() can return a partial request)
+    std::string reqText;
     char buf[8192];
-    int received = recv(sock, buf, sizeof(buf) - 1, 0);
-    if (received <= 0) { closesocket(sock); return; }
-    buf[received] = '\0';
-    std::string reqText(buf, received);
+    for (;;) {
+        int received = recv(sock, buf, sizeof(buf), 0);
+        if (received <= 0) { closesocket(sock); return; }
+        reqText.append(buf, received);
+        if (reqText.find("\r\n\r\n") != std::string::npos) break;
+        if (reqText.size() > 65536) { closesocket(sock); return; } // header abuse guard
+    }
+    // Honor Content-Length so a segmented POST body isn't truncated
+    size_t hdrEnd = reqText.find("\r\n\r\n");
+    int contentLength = 0;
+    size_t cl = reqText.find("Content-Length:");
+    if (cl == std::string::npos) cl = reqText.find("content-length:");
+    if (cl != std::string::npos && cl < hdrEnd) contentLength = atoi(reqText.c_str() + cl + 15);
+    size_t bodyHave = reqText.size() - (hdrEnd + 4);
+    while (contentLength > 0 && bodyHave < (size_t)contentLength) {
+        int received = recv(sock, buf, sizeof(buf), 0);
+        if (received <= 0) break;
+        reqText.append(buf, received);
+        bodyHave += received;
+        if (reqText.size() > 4 * 1024 * 1024) break; // body abuse guard
+    }
     std::string path = GetRequestPath(reqText);
 
     if (path.rfind("/api/help", 0) == 0) {
-        const char* help = "{\"endpoints\":[\"/api/help\",\"/api/state\",\"/api/action\",\"/api/screenshot?scale=N\",\"/api/events?since=N\"],"
+        const char* help = "{\"endpoints\":[\"/api/help\",\"/api/state\",\"/api/action\",\"/api/screenshot?scale=N&raw=1\",\"/api/events?since=N&wait=ms\"],"
             "\"actions\":[\"ping\",\"launch\",\"switch_desktop\",\"create_desktop\",\"close_desktop\","
             "\"open_folder\",\"exit_folder\",\"focus_window\",\"select\",\"deselect_all\",\"delete_selected\","
-            "\"reload_apps\",\"toggle_mode\",\"set_camera\",\"set_model\",\"reset_model\",\"set_volume\",\"get_log\"]}";
+            "\"reload_apps\",\"toggle_mode\",\"set_camera\",\"set_model\",\"reset_model\",\"set_volume\",\"get_log\","
+            "\"describe_scene\",\"quit\"],"
+            "\"notes\":{\"set_camera\":\"px/py/pz + rx/ry/rz (or pitch/yaw/roll), angles in degrees\","
+            "\"screenshot\":\"BMP; base64 JSON by default, raw=1 for binary\"}}";
         SendHttp(sock, 200, "OK", help);
     }
     else if (path.rfind("/api/events", 0) == 0) {
@@ -159,7 +196,11 @@ static void HandleConnection(SOCKET sock) {
             size_t s = query.find("since=");
             if (s != std::string::npos) since = _strtoi64(query.c_str() + s + 6, nullptr, 10);
             size_t w = query.find("wait=");
-            if (w != std::string::npos) waitMs = atoi(query.c_str() + w + 5);
+            if (w != std::string::npos) {
+                waitMs = atoi(query.c_str() + w + 5);
+                if (waitMs < 0) waitMs = 0;
+                if (waitMs > 30000) waitMs = 30000; // a huge wait= would monopolize the server
+            }
         }
         // Long-poll: wait up to waitMs for new events beyond 'since'
         if (waitMs > 0) {
@@ -216,7 +257,15 @@ static void HandleConnection(SOCKET sock) {
         std::string result;
         {
             std::lock_guard<std::mutex> lock(g_reqMutex);
-            result = g_actionResultReady.load() ? g_actionResult : "{\"error\":\"timeout\"}";
+            bool ready = g_actionResultReady.load();
+            result = ready ? g_actionResult : "{\"error\":\"timeout\"}";
+            if (!ready) {
+                // Clear a stale pending action so it can't execute late and
+                // land its result on the NEXT request's response.
+                g_actionPending.store(false);
+                g_pendingAction.clear();
+                LOG("[ai] action timeout — pending request cleared");
+            }
             g_actionResultReady.store(false);
         }
         SendHttp(sock, 200, "OK", result);
@@ -231,7 +280,7 @@ static void HandleConnection(SOCKET sock) {
             size_t s = query.find("scale=");
             if (s != std::string::npos) maxDim = atoi(query.c_str() + s + 6);
             size_t r = query.find("raw=");
-            if (r != std::string::npos && strstr(query.c_str() + r + 4, "1") != nullptr) rawMode = true;
+            if (r != std::string::npos && r + 4 < query.size() && query[r + 4] == '1') rawMode = true;
         }
         g_screenshotMaxDim.store(maxDim);
         g_screenshotRawMode.store(rawMode);
@@ -258,8 +307,8 @@ static void HandleConnection(SOCKET sock) {
                 char head[256];
                 sprintf_s(head, "HTTP/1.1 200 OK\r\nContent-Type: image/bmp\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
                           (unsigned)body.size());
-                send(sock, head, (int)strlen(head), 0);
-                send(sock, body.data(), (int)body.size(), 0);
+                SendAll(sock, head, (int)strlen(head));
+                SendAll(sock, body.data(), (int)body.size());
             } else if (!errJson.empty()) {
                 SendHttp(sock, 200, "OK", errJson);  // report error reason as JSON
             } else {

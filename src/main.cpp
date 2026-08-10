@@ -435,6 +435,22 @@ extern float g_modelFov;
 extern DirectX::XMFLOAT4 g_modelMatParams;
 extern DirectX::XMFLOAT4 g_modelColorTint;
 
+// Heap-backed snprintf: sprintf_s into fixed buffers invokes the invalid
+// parameter handler (process termination) on overflow — long CJK window
+// titles/paths in UTF-8 easily exceed 512 bytes. This never terminates.
+static std::string Fmt(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    va_list args2; va_copy(args2, args);
+    int n = vsnprintf(nullptr, 0, fmt, args);
+    va_end(args);
+    if (n <= 0) { va_end(args2); return {}; }
+    std::string out(n, '\0');
+    vsnprintf(out.data(), n + 1, fmt, args2);
+    va_end(args2);
+    return out;
+}
+
 static void BuildStateSnapshot(Camera& camera) {
     std::string js = "{";
     // Core state
@@ -461,13 +477,11 @@ static void BuildStateSnapshot(Camera& camera) {
     js += ",\"cubes\":[";
     for (size_t i = 0; i < g_myApps.size(); ++i) {
         if (i) js += ",";
-        char buf[512];
         const auto& c = g_myApps[i];
-        sprintf_s(buf, "{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"selected\":%s}",
+        js += Fmt("{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"selected\":%s}",
                   (int)i, Json::Escape(c.AppName).c_str(), Json::Escape(WcsToUtf8(c.AppPath)).c_str(),
                   c.Position.x, c.Position.y, c.Position.z,
                   c.IsSelected ? "true" : "false");
-        js += buf;
     }
     js += "]";
     // Virtual desktop
@@ -479,11 +493,9 @@ static void BuildStateSnapshot(Camera& camera) {
     if (g_isInFolder) {
         std::string folderName = g_folderStack.empty() ? "" : (g_folderStack.back().folderPath.empty()
             ? "" : WcsToUtf8(g_folderStack.back().folderPath));
-        char fbuf[512];
-        sprintf_s(fbuf, "{\"active\":true,\"depth\":%zu,\"path\":\"%s\",\"maximized\":%s}",
+        js += Fmt("{\"active\":true,\"depth\":%zu,\"path\":\"%s\",\"maximized\":%s}",
                   g_folderStack.size(), Json::Escape(folderName).c_str(),
                   g_isFolderMaximized ? "true" : "false");
-        js += fbuf;
     } else {
         js += "{\"active\":false}";
     }
@@ -495,25 +507,28 @@ static void BuildStateSnapshot(Camera& camera) {
         DWORD pid = 0; GetWindowThreadProcessId(w.hwnd, &pid);
         std::wstring path = GetProcessPath(pid);
         WCHAR title[256]; GetWindowTextW(w.hwnd, title, 256);
-        char wbuf[512];
-        sprintf_s(wbuf, "%s{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
+        js += Fmt("%s{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
                   firstW ? "" : ",", w.hwnd, pid, Json::Escape(WcsToUtf8(path)).c_str(),
                   Json::Escape(WcsToUtf8(title)).c_str());
-        js += wbuf;
         firstW = false;
     }
     js += "]";
-    // Running (non-hijacked) windows: system-wide window snapshot
+    // Running (non-hijacked) windows: system-wide window snapshot.
+    // Full enumeration is expensive — cache at ~2 Hz (this fn runs at 10 Hz).
     js += ",\"running\":[";
-    std::vector<RunningWindow> rw = EnumerateRunningWindows(g_mainHwnd);
+    static std::vector<RunningWindow> s_rwCache;
+    static DWORD s_rwTick = 0;
+    if (GetTickCount() - s_rwTick > 500) {
+        s_rwTick = GetTickCount();
+        s_rwCache = EnumerateRunningWindows(g_mainHwnd);
+    }
+    const std::vector<RunningWindow>& rw = s_rwCache;
     bool firstR = true;
     for (const auto& win : rw) {
         if (firstR) firstR = false; else js += ",";
-        char rbuf[512];
-        sprintf_s(rbuf, "{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
+        js += Fmt("{\"hwnd\":%p,\"pid\":%lu,\"path\":\"%s\",\"title\":\"%s\"}",
                   win.hwnd, win.pid, Json::Escape(WcsToUtf8(win.path)).c_str(),
                   Json::Escape(WcsToUtf8(win.title)).c_str());
-        js += rbuf;
     }
     js += "]}";
 
@@ -772,6 +787,9 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
 
 // Capture current backbuffer as a BMP, base64-encode into JSON.
 static void CaptureScreenshot() {
+    // The HTTP thread reads/clears the result strings under g_reqMutex —
+    // write them under the same lock to rule out races on the timeout path.
+    std::lock_guard<std::mutex> reqLock(AIServer::g_reqMutex);
     if (!g_pSwapChain || !g_pd3dDeviceContext || g_aiFrameW < 1 || g_aiFrameH < 1) {
         LOG("[screenshot] FAIL no device swap=%d ctx=%d fw=%d", g_pSwapChain!=nullptr, g_pd3dDeviceContext!=nullptr, g_aiFrameW);
         AIServer::g_screenshotResult = "{\"error\":\"no device\"}";
