@@ -27,7 +27,7 @@
 ### Compiled source files (`tasks.json` explicit file list)
 | File | Lines | Notes |
 |---|---|---|
-| `src/main.cpp` | ~3900 | Entry point. `wWinMain`, state machine, taskbar UI, window chrome, raycasting, drag-drop, folder portal, virtual desktops, AI action dispatch, LL keyboard hook |
+| `src/main.cpp` | ~2720 | Entry point. `wWinMain`, state machine, raycasting, drag-drop, 3D render loop, AI action dispatch, LL keyboard hook |
 | `src/Engine/Camera.cpp` | 69 | FPS-style camera (rotation only, `Move()` exists but never called) |
 | `src/Engine/SkyboxRenderer.cpp` | 147 | Procedural skybox |
 | `src/Engine/CubeRenderer.cpp` | 251 | 3D icon cubes + spherical sector selection |
@@ -44,8 +44,12 @@
 - `src/Engine/JsonUtils.h` (75 lines) — minimal JSON escape + flat field parser.
 - `src/Shell/AIServer.h` (327 lines) — HTTP/JSON control interface (`127.0.0.1:52317`), background thread, actions marshaled to main thread.
 - `src/Shell/DesktopManager.h` (315 lines) — `AppCube`, desktop scan, `.cddesk` v3 persistence (positions + removal tombstones), search. UTF-8 helpers `WcsToUtf8`/`Utf8ToWcs` live here.
-- `src/Shell/WindowManager.h` (222 lines) — window enumeration, hijack queue, icon cache. `WM_GETICON` uses `SendMessageTimeout` (hung apps must not freeze the shell).
+- `src/Shell/WindowManager.h` (338 lines) — window enumeration, hijack queue, icon cache. `WM_GETICON` uses `SendMessageTimeout` (hung apps must not freeze the shell).
 - `src/Shell/SystemInfo.h` (109 lines) — audio, IME, network status (call sites throttled to ~2 Hz).
+- `src/Shell/VirtualDesktop.h` (313 lines) — multi-desktop state, desktop switching/creation/closure, task view spatial overview.
+- `src/Shell/FolderPortal.h` (438 lines) — folder portal navigation stack, breadcrumb header, windowed/maximized transitions.
+- `src/Shell/WindowChrome.h` (224 lines) — window snapping detection, edge snapping preview, hijacked window titlebar chrome.
+- `src/Shell/TaskbarUI.h` (872 lines) — taskbar rendering, pinned/running icon management, system tray indicators, Start menu popup.
 
 ## Architecture
 
@@ -147,7 +151,7 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
 | 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | ✅ for cubes — positions + removal tombstones via `.cddesk` v3 (per virtual desktop). Pinned apps/preferences still not persisted |
-| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | ✅ — split into `src/Shell/DesktopManager.h` (224L) / `WindowManager.h` (235L) / `SystemInfo.h` (122L). main.cpp 2612→2126 lines |
+| 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | ✅ — fully modularized: split into `VirtualDesktop.h`, `FolderPortal.h`, `WindowChrome.h`, `TaskbarUI.h`, `DesktopManager.h`, `WindowManager.h`, `SystemInfo.h`. main.cpp 4444→2722 lines (~39% reduction) |
 | 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None | ✅ |
 | 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None | ✅ |
 
