@@ -36,10 +36,9 @@ static void KillAllCrossDim() {
     CloseHandle(hSnap);
 }
 
-static void RestoreDefaultShell() {
+static void RestoreShellKey(HKEY root) {
     HKEY hKey = nullptr;
-    LSTATUS status = RegOpenKeyExW(
-        HKEY_LOCAL_MACHINE, kRegPath, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
+    LSTATUS status = RegOpenKeyExW(root, kRegPath, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
     if (status != ERROR_SUCCESS) return;
 
     WCHAR current[512] = {};
@@ -58,6 +57,11 @@ static void RestoreDefaultShell() {
     RegCloseKey(hKey);
 }
 
+static void RestoreDefaultShell() {
+    RestoreShellKey(HKEY_CURRENT_USER);
+    RestoreShellKey(HKEY_LOCAL_MACHINE);
+}
+
 static void LaunchExplorer() {
     STARTUPINFOW si = { sizeof(si) };
     si.wShowWindow = SW_SHOWNORMAL;
@@ -70,24 +74,30 @@ static void LaunchExplorer() {
 }
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
-    HANDLE hHeartbeat = OpenEventW(SYNCHRONIZE, FALSE, kEventName);
-    if (!hHeartbeat) {
-        for (int retry = 0; retry < 10; ++retry) {
-            Sleep(500);
-            hHeartbeat = OpenEventW(SYNCHRONIZE, FALSE, kEventName);
-            if (hHeartbeat) break;
-        }
-        if (!hHeartbeat) return 1;
+    HANDLE hSingleton = CreateMutexW(nullptr, TRUE, L"Local\\CrossDim_Watchdog");
+    if (hSingleton && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hSingleton);
+        return 0;
     }
 
-    HANDLE hShutdown = OpenEventW(SYNCHRONIZE, FALSE, kShutdownEventName);
-    if (!hShutdown) {
+    auto openEvt = [](LPCWSTR globalName, LPCWSTR localName) -> HANDLE {
+        HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, globalName);
+        if (h) return h;
+        h = OpenEventW(SYNCHRONIZE, FALSE, localName);
+        if (h) return h;
         for (int retry = 0; retry < 10; ++retry) {
             Sleep(500);
-            hShutdown = OpenEventW(SYNCHRONIZE, FALSE, kShutdownEventName);
-            if (hShutdown) break;
+            h = OpenEventW(SYNCHRONIZE, FALSE, globalName);
+            if (h) return h;
+            h = OpenEventW(SYNCHRONIZE, FALSE, localName);
+            if (h) return h;
         }
-    }
+        return nullptr;
+    };
+    HANDLE hHeartbeat = openEvt(kEventName, L"Local\\CrossDim_Heartbeat");
+    if (!hHeartbeat) return 1;
+
+    HANDLE hShutdown = openEvt(kShutdownEventName, L"Local\\CrossDim_Shutdown");
 
     HANDLE hEvents[2] = { hHeartbeat, hShutdown };
     DWORD eventCount = hShutdown ? 2 : 1;

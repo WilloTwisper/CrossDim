@@ -5,11 +5,13 @@
 using namespace DirectX;
 
 CubeRenderer::CubeRenderer() : m_vertexShader(nullptr), m_pixelShader(nullptr), m_inputLayout(nullptr), 
-    m_vertexBuffer(nullptr), m_indexBuffer(nullptr), m_constantBuffer(nullptr), m_samplerState(nullptr) {}
+    m_vertexBuffer(nullptr), m_indexBuffer(nullptr), m_constantBuffer(nullptr), m_samplerState(nullptr),
+    m_rasterizerState(nullptr) {}
 
 CubeRenderer::~CubeRenderer() { Cleanup(); }
 
 void CubeRenderer::Cleanup() {
+    if (m_rasterizerState) { m_rasterizerState->Release(); m_rasterizerState = nullptr; }
     if (m_samplerState) { m_samplerState->Release(); m_samplerState = nullptr; }
     if (m_constantBuffer) { m_constantBuffer->Release(); m_constantBuffer = nullptr; }
     if (m_indexBuffer) { m_indexBuffer->Release(); m_indexBuffer = nullptr; }
@@ -102,14 +104,14 @@ bool CubeRenderer::Initialize(ID3D11Device* device) {
             }
 
             float3 rayDir = normalize(input.localPos - LocalCamPos);
-            float stepSize = 1.732f / 60.0f; 
+            float stepSize = 1.732f / 32.0f;
             float3 stepVec = rayDir * stepSize;
             float3 currentPos = input.localPos + rayDir * 0.001f; 
             
             float4 hitColor = float4(0, 0, 0, 0);
             float isSide = 0.0f;
 
-            for(int i = 0; i < 60; i++) {
+            for(int i = 0; i < 32; i++) {
                 if(abs(currentPos.x) > 0.501f || abs(currentPos.y) > 0.501f || abs(currentPos.z) > 0.501f) break;
                 float cx = currentPos.x * 1.25f; float cy = currentPos.y * 1.25f;
                 if (abs(cx) < 0.5f && abs(cy) < 0.5f) {
@@ -131,9 +133,14 @@ bool CubeRenderer::Initialize(ID3D11Device* device) {
     )";
 
     ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* errBlob = nullptr;
-    D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "VS_Main", "vs_5_0", 0, 0, &vsBlob, &errBlob);
+    const UINT kShaderFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    HRESULT hr = D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "VS_Main", "vs_5_0", kShaderFlags, 0, &vsBlob, &errBlob);
+    if (FAILED(hr) || !vsBlob) { if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
     device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vertexShader);
-    D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "PS_Main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    hr = D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "PS_Main", "ps_5_0", kShaderFlags, 0, &psBlob, &errBlob);
+    if (FAILED(hr) || !psBlob) { vsBlob->Release(); if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) errBlob->Release();
     device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_pixelShader);
 
     D3D11_INPUT_ELEMENT_DESC layout[] = {
@@ -177,6 +184,12 @@ bool CubeRenderer::Initialize(ID3D11Device* device) {
     sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampDesc.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
     device->CreateSamplerState(&sampDesc, &m_samplerState);
+
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_BACK;
+    rd.DepthClipEnable = TRUE;
+    device->CreateRasterizerState(&rd, &m_rasterizerState);
 
     return true;
 }
@@ -242,8 +255,9 @@ void CubeRenderer::Render(ID3D11DeviceContext* context, XMMATRIX viewProjection,
     context->PSSetShader(m_pixelShader, nullptr, 0);
     context->VSSetConstantBuffers(0, 1, &m_constantBuffer);
     context->PSSetConstantBuffers(0, 1, &m_constantBuffer);
-    context->PSSetSamplers(0, 1, &m_samplerState); 
-    
+    context->PSSetSamplers(0, 1, &m_samplerState);
+    if (m_rasterizerState) context->RSSetState(m_rasterizerState);
+
     if (texture) context->PSSetShaderResources(0, 1, &texture);
     else { ID3D11ShaderResourceView* nullSRV = nullptr; context->PSSetShaderResources(0, 1, &nullSRV); }
 

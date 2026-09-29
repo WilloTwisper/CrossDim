@@ -101,9 +101,10 @@ bool ModelRenderer::Initialize(ID3D11Device* device) {
 
     // ...[中间的编译着色器和布局代码保持不变] ...
     ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr;
-    if (FAILED(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr))) return false;
+    const UINT kShaderFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    if (FAILED(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", kShaderFlags, 0, &vsBlob, nullptr))) return false;
     if (FAILED(m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs))) { vsBlob->Release(); return false; }
-    if (FAILED(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psBlob, nullptr))) { vsBlob->Release(); return false; }
+    if (FAILED(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", kShaderFlags, 0, &psBlob, nullptr))) { vsBlob->Release(); return false; }
     if (FAILED(m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps))) { vsBlob->Release(); psBlob->Release(); return false; }
 
     D3D11_INPUT_ELEMENT_DESC elems[] = {
@@ -209,8 +210,50 @@ bool ModelRenderer::LoadModelAsync(const std::string& filepath) {
     m_loadThread = std::thread([this, filepath]() {
         std::vector<ModelVertex> v; std::vector<unsigned int> i;
         bool ok = ObjLoader::LoadObj(filepath, v, i);
+        XMFLOAT3 center = { 0.0f, 0.0f, 0.0f };
+        if (ok && !v.empty() && !i.empty()) {
+            XMFLOAT3 mn = v[0].Position;
+            XMFLOAT3 mx = v[0].Position;
+            for (size_t vi = 1; vi < v.size(); ++vi) {
+                XMFLOAT3 p = v[vi].Position;
+                mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y); mn.z = min(mn.z, p.z);
+                mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y); mx.z = max(mx.z, p.z);
+            }
+            center.x = (mn.x + mx.x) * 0.5f;
+            center.y = (mn.y + mx.y) * 0.5f;
+            center.z = (mn.z + mx.z) * 0.5f;
+
+            std::vector<XMFLOAT3> tanAccum(v.size());
+            for (size_t ti = 0; ti + 2 < i.size(); ti += 3) {
+                unsigned int i0 = i[ti]; unsigned int i1 = i[ti+1]; unsigned int i2 = i[ti+2];
+                if (i0 >= v.size() || i1 >= v.size() || i2 >= v.size()) continue;
+                XMFLOAT3 p0 = v[i0].Position; XMFLOAT3 p1 = v[i1].Position; XMFLOAT3 p2 = v[i2].Position;
+                XMFLOAT2 uv0 = v[i0].UV; XMFLOAT2 uv1 = v[i1].UV; XMFLOAT2 uv2 = v[i2].UV;
+                XMVECTOR v0 = XMLoadFloat3(&p0); XMVECTOR v1 = XMLoadFloat3(&p1); XMVECTOR v2 = XMLoadFloat3(&p2);
+                XMVECTOR edge1 = v1 - v0; XMVECTOR edge2 = v2 - v0;
+                XMFLOAT3 e1, e2; XMStoreFloat3(&e1, edge1); XMStoreFloat3(&e2, edge2);
+                float du1 = uv1.x - uv0.x; float dv1 = uv1.y - uv0.y;
+                float du2 = uv2.x - uv0.x; float dv2 = uv2.y - uv0.y;
+                float r = (du1 * dv2 - du2 * dv1);
+                float inv = (r == 0.0f) ? 0.0f : 1.0f / r;
+                XMFLOAT3 tangent;
+                tangent.x = inv * (dv2 * e1.x - dv1 * e2.x);
+                tangent.y = inv * (dv2 * e1.y - dv1 * e2.y);
+                tangent.z = inv * (dv2 * e1.z - dv1 * e2.z);
+                tanAccum[i0].x += tangent.x; tanAccum[i0].y += tangent.y; tanAccum[i0].z += tangent.z;
+                tanAccum[i1].x += tangent.x; tanAccum[i1].y += tangent.y; tanAccum[i1].z += tangent.z;
+                tanAccum[i2].x += tangent.x; tanAccum[i2].y += tangent.y; tanAccum[i2].z += tangent.z;
+            }
+            for (size_t vi = 0; vi < v.size(); ++vi) {
+                XMVECTOR n = XMLoadFloat3(&v[vi].Normal);
+                XMVECTOR t = XMLoadFloat3(&tanAccum[vi]);
+                XMVECTOR proj = XMVector3Normalize(XMVectorSubtract(t, XMVectorScale(n, XMVectorGetX(XMVector3Dot(n, t)))));
+                XMFLOAT3 finalT; XMStoreFloat3(&finalT, proj);
+                v[vi].Tangent = finalT;
+            }
+        }
         std::lock_guard<std::mutex> lk(m_pendingMutex);
-        if (ok) { m_pendingVerts = std::move(v); m_pendingInds = std::move(i); }
+        if (ok) { m_pendingVerts = std::move(v); m_pendingInds = std::move(i); m_modelCenter = center; }
         m_loadReady.store(true);
     });
 
@@ -236,50 +279,7 @@ void ModelRenderer::PollFinalizeLoad() {
         return;
     }
 
-    // compute model bounds center (local space) before tangents
-    if (!verts.empty()) {
-        XMFLOAT3 mn = verts[0].Position;
-        XMFLOAT3 mx = verts[0].Position;
-        for (size_t vi = 1; vi < verts.size(); ++vi) {
-            XMFLOAT3 p = verts[vi].Position;
-            mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y); mn.z = min(mn.z, p.z);
-            mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y); mx.z = max(mx.z, p.z);
-        }
-        m_modelCenter.x = (mn.x + mx.x) * 0.5f;
-        m_modelCenter.y = (mn.y + mx.y) * 0.5f;
-        m_modelCenter.z = (mn.z + mx.z) * 0.5f;
-    }
-
-    // compute tangents (same as before)
-    std::vector<XMFLOAT3> tanAccum(verts.size());
-    for (size_t i = 0; i < inds.size(); i += 3) {
-        unsigned int i0 = inds[i]; unsigned int i1 = inds[i+1]; unsigned int i2 = inds[i+2];
-        XMFLOAT3 p0 = verts[i0].Position; XMFLOAT3 p1 = verts[i1].Position; XMFLOAT3 p2 = verts[i2].Position;
-        XMFLOAT2 uv0 = verts[i0].UV; XMFLOAT2 uv1 = verts[i1].UV; XMFLOAT2 uv2 = verts[i2].UV;
-        XMVECTOR v0 = XMLoadFloat3(&p0); XMVECTOR v1 = XMLoadFloat3(&p1); XMVECTOR v2 = XMLoadFloat3(&p2);
-        XMVECTOR edge1 = v1 - v0; XMVECTOR edge2 = v2 - v0;
-        XMFLOAT3 e1, e2; XMStoreFloat3(&e1, edge1); XMStoreFloat3(&e2, edge2);
-        float du1 = uv1.x - uv0.x; float dv1 = uv1.y - uv0.y;
-        float du2 = uv2.x - uv0.x; float dv2 = uv2.y - uv0.y;
-        float r = (du1 * dv2 - du2 * dv1);
-        float inv = (r == 0.0f) ? 0.0f : 1.0f / r;
-        XMFLOAT3 tangent;
-        tangent.x = inv * (dv2 * e1.x - dv1 * e2.x);
-        tangent.y = inv * (dv2 * e1.y - dv1 * e2.y);
-        tangent.z = inv * (dv2 * e1.z - dv1 * e2.z);
-        tanAccum[i0].x += tangent.x; tanAccum[i0].y += tangent.y; tanAccum[i0].z += tangent.z;
-        tanAccum[i1].x += tangent.x; tanAccum[i1].y += tangent.y; tanAccum[i1].z += tangent.z;
-        tanAccum[i2].x += tangent.x; tanAccum[i2].y += tangent.y; tanAccum[i2].z += tangent.z;
-    }
-    for (size_t i = 0; i < verts.size(); ++i) {
-        XMVECTOR n = XMLoadFloat3(&verts[i].Normal);
-        XMVECTOR t = XMLoadFloat3(&tanAccum[i]);
-        XMVECTOR proj = XMVector3Normalize(XMVectorSubtract(t, XMVectorScale(n, XMVectorGetX(XMVector3Dot(n, t)))));
-        XMFLOAT3 finalT; XMStoreFloat3(&finalT, proj);
-        verts[i].Tangent = finalT;
-    }
-
-    // create immutable vertex/index buffers on main thread
+    // Bounds + tangents are computed on the worker. Create GPU buffers here.
     if (m_vb) { m_vb->Release(); m_vb = nullptr; }
     if (m_ib) { m_ib->Release(); m_ib = nullptr; }
 

@@ -111,7 +111,10 @@ struct VertexKey {
 // 哈希函数，用于 unordered_map 极速查找
 struct VertexKeyHash {
     std::size_t operator()(const VertexKey& k) const {
-        return ((std::hash<int>()(k.v) ^ (std::hash<int>()(k.vt) << 1)) >> 1) ^ (std::hash<int>()(k.vn) << 1);
+        std::size_t h = std::hash<int>()(k.v);
+        h ^= std::hash<int>()(k.vt) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(k.vn) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
 };
 

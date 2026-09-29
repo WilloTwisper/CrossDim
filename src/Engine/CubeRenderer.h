@@ -33,6 +33,7 @@ private:
     ID3D11Buffer*       m_indexBuffer;
     ID3D11Buffer*       m_constantBuffer;
     ID3D11SamplerState* m_samplerState;
+    ID3D11RasterizerState* m_rasterizerState;
 
     struct Vertex {
         DirectX::XMFLOAT3 Pos;

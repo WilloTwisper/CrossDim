@@ -90,15 +90,19 @@ bool SkyboxRenderer::Initialize(ID3D11Device* device) {
     )";
 
     ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* errBlob = nullptr;
-    D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "VS_Main", "vs_5_0", 0, 0, &vsBlob, &errBlob);
+    const UINT kShaderFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    HRESULT hr = D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "VS_Main", "vs_5_0", kShaderFlags, 0, &vsBlob, &errBlob);
+    if (FAILED(hr) || !vsBlob) { if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) { errBlob->Release(); errBlob = nullptr; }
     device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vertexShader);
     
-    D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "PS_Main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    hr = D3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "PS_Main", "ps_5_0", kShaderFlags, 0, &psBlob, &errBlob);
+    if (FAILED(hr) || !psBlob) { vsBlob->Release(); if (errBlob) errBlob->Release(); return false; }
+    if (errBlob) errBlob->Release();
     device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_pixelShader);
 
-    if (vsBlob) vsBlob->Release();
-    if (psBlob) psBlob->Release();
-    if (errBlob) errBlob->Release();
+    vsBlob->Release();
+    psBlob->Release();
 
     D3D11_BUFFER_DESC cbd = {};
     cbd.Usage = D3D11_USAGE_DEFAULT;

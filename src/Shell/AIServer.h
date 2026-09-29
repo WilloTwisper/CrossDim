@@ -33,6 +33,7 @@ namespace AIServer {
 // them periodically in the render loop and writes back results.
 
 inline std::mutex g_reqMutex;
+inline std::mutex g_rpcMutex; // serialize action + screenshot across HTTP worker threads
 inline std::atomic<bool> g_finished{false};
 
 inline std::string g_sharedStateJson;         // published by main thread (mutex-protected)
@@ -134,8 +135,14 @@ static bool SendAll(SOCKET sock, const char* data, int len) {
 static void SendHttp(SOCKET sock, int statusCode, const char* statusText,
                      const std::string& body, const std::string& contentType = "application/json") {
     char head[512];
+    const char* ctype = contentType.c_str();
+    char typeBuf[160];
+    if (contentType == "application/json") {
+        strcpy_s(typeBuf, "application/json; charset=utf-8");
+        ctype = typeBuf;
+    }
     sprintf_s(head, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-              statusCode, statusText, contentType.c_str(), (unsigned)body.size());
+              statusCode, statusText, ctype, (unsigned)body.size());
     SendAll(sock, head, (int)strlen(head));
     SendAll(sock, body.data(), (int)body.size());
 }
@@ -175,6 +182,78 @@ static void HandleConnection(SOCKET sock) {
         if (reqText.size() > 4 * 1024 * 1024) break; // body abuse guard
     }
     std::string path = GetRequestPath(reqText);
+
+    // Security guard: protect against DNS Rebinding, Cross-Site Request Forgery, and unauthorized control
+    {
+        // 1. Host header validation (DNS Rebinding Guard)
+        size_t hostPos = reqText.find("Host:");
+        if (hostPos == std::string::npos) hostPos = reqText.find("host:");
+        if (hostPos != std::string::npos) {
+            size_t endLine = reqText.find("\r\n", hostPos);
+            std::string hostVal = reqText.substr(hostPos + 5, endLine != std::string::npos ? endLine - hostPos - 5 : std::string::npos);
+            size_t firstChar = hostVal.find_first_not_of(" \t");
+            if (firstChar != std::string::npos) hostVal = hostVal.substr(firstChar);
+            size_t lastChar = hostVal.find_last_not_of(" \t\r\n");
+            if (lastChar != std::string::npos) hostVal = hostVal.substr(0, lastChar + 1);
+            if (hostVal.rfind("127.0.0.1", 0) != 0 &&
+                hostVal.rfind("localhost", 0) != 0 &&
+                hostVal.rfind("[::1]", 0) != 0) {
+                SendHttp(sock, 403, "Forbidden", "{\"error\":\"forbidden host\"}");
+                closesocket(sock);
+                return;
+            }
+        }
+
+        // 2. Origin validation (Browser CSRF / Cross-Origin Web Guard)
+        size_t originPos = reqText.find("Origin:");
+        if (originPos == std::string::npos) originPos = reqText.find("origin:");
+        if (originPos != std::string::npos) {
+            size_t endLine = reqText.find("\r\n", originPos);
+            std::string originVal = reqText.substr(originPos + 7, endLine != std::string::npos ? endLine - originPos - 7 : std::string::npos);
+            size_t firstChar = originVal.find_first_not_of(" \t");
+            if (firstChar != std::string::npos) originVal = originVal.substr(firstChar);
+            if (originVal.rfind("http://127.0.0.1", 0) != 0 &&
+                originVal.rfind("http://localhost", 0) != 0 &&
+                originVal.rfind("null", 0) != 0) {
+                SendHttp(sock, 403, "Forbidden", "{\"error\":\"cross-origin request blocked\"}");
+                closesocket(sock);
+                return;
+            }
+        }
+
+        // 3. Optional bearer token (CROSSDIM_TOKEN)
+        char envToken[256] = {};
+        if (GetEnvironmentVariableA("CROSSDIM_TOKEN", envToken, sizeof(envToken)) > 0 && envToken[0]) {
+            std::string token(envToken);
+            bool tokenMatched = false;
+            size_t authPos = reqText.find("Authorization:");
+            if (authPos == std::string::npos) authPos = reqText.find("authorization:");
+            if (authPos != std::string::npos) {
+                size_t bearerPos = reqText.find("Bearer ", authPos);
+                if (bearerPos != std::string::npos && bearerPos < reqText.find("\r\n", authPos)) {
+                    size_t tokenStart = bearerPos + 7;
+                    size_t tokenEnd = reqText.find_first_of(" \r\n", tokenStart);
+                    if (reqText.substr(tokenStart, tokenEnd - tokenStart) == token) {
+                        tokenMatched = true;
+                    }
+                }
+            }
+            if (!tokenMatched) {
+                size_t tp = path.find("token=");
+                if (tp != std::string::npos) {
+                    size_t tEnd = path.find_first_of("&#", tp + 6);
+                    if (path.substr(tp + 6, tEnd != std::string::npos ? tEnd - tp - 6 : std::string::npos) == token) {
+                        tokenMatched = true;
+                    }
+                }
+            }
+            if (!tokenMatched) {
+                SendHttp(sock, 401, "Unauthorized", "{\"error\":\"valid CROSSDIM_TOKEN required\"}");
+                closesocket(sock);
+                return;
+            }
+        }
+    }
 
     if (path.rfind("/api/help", 0) == 0) {
         const char* help = "{\"endpoints\":[\"/api/help\",\"/api/state\",\"/api/action\",\"/api/screenshot?scale=N&raw=1\",\"/api/events?since=N&wait=ms\"],"
@@ -241,6 +320,7 @@ static void HandleConnection(SOCKET sock) {
         SendHttp(sock, 200, "OK", body);
     }
     else if (path.rfind("/api/action", 0) == 0) {
+        std::lock_guard<std::mutex> rpc(g_rpcMutex);
         std::string body = GetRequestBody(reqText);
         {
             std::lock_guard<std::mutex> lock(g_reqMutex);
@@ -271,6 +351,7 @@ static void HandleConnection(SOCKET sock) {
         SendHttp(sock, 200, "OK", result);
     }
     else if (path.rfind("/api/screenshot", 0) == 0) {
+        std::lock_guard<std::mutex> rpc(g_rpcMutex);
         // Parse query params: scale=N, raw=1
         int maxDim = 0;
         bool rawMode = false;
@@ -371,8 +452,7 @@ static void ServerThreadProc() {
         if (sel > 0 && FD_ISSET(listenSock, &readfds)) {
             SOCKET client = accept(listenSock, nullptr, nullptr);
             if (client != INVALID_SOCKET) {
-                // Handle synchronously (one at a time) for simplicity in this milestone.
-                HandleConnection(client);
+                std::thread(HandleConnection, client).detach();
             }
         }
     }

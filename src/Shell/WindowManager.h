@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <d3d11.h>
 #include <DirectXMath.h>
 #include <string>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <objbase.h>
 #include "Engine/TextureLoader.h"
 
@@ -25,7 +27,6 @@ struct HijackedWindow {
 };
 inline std::vector<HijackedWindow> g_hijackedWindows;
 
-inline std::unordered_map<std::wstring, ID3D11ShaderResourceView*> g_taskbarIconCache;
 inline std::unordered_map<HWND, ID3D11ShaderResourceView*> g_taskbarWindowIconCache;
 inline std::unordered_map<HWND, int> g_taskbarDynamicOrder;
 inline int g_taskbarDynamicOrderCounter = 1;
@@ -80,15 +81,30 @@ static HWND FindWindowFromProcessId(DWORD pid) {
 }
 
 static std::wstring GetProcessPath(DWORD pid) {
+    struct PidPathEntry { std::wstring path; DWORD tick; };
+    static std::unordered_map<DWORD, PidPathEntry> s_pidPathCache;
+    DWORD now = GetTickCount();
+    auto cached = s_pidPathCache.find(pid);
+    if (cached != s_pidPathCache.end() && (now - cached->second.tick) < 2000)
+        return cached->second.path;
+
     std::wstring path;
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!hProc) return path;
-    WCHAR buffer[MAX_PATH];
-    DWORD size = MAX_PATH;
-    if (QueryFullProcessImageNameW(hProc, 0, buffer, &size)) {
-        path.assign(buffer, size);
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProc) {
+        WCHAR buffer[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, buffer, &size)) {
+            path.assign(buffer, size);
+        }
+        CloseHandle(hProc);
     }
-    CloseHandle(hProc);
+    s_pidPathCache[pid] = { path, now };
+    if (s_pidPathCache.size() > 256) {
+        for (auto it = s_pidPathCache.begin(); it != s_pidPathCache.end(); ) {
+            if ((now - it->second.tick) > 8000) it = s_pidPathCache.erase(it);
+            else ++it;
+        }
+    }
     return path;
 }
 
@@ -177,24 +193,80 @@ static HWND FindRunningHwnd(const std::wstring& appPath) {
     return ctx.result;
 }
 
+static HWND FindRunningHwndInList(const std::wstring& appPath, const std::vector<RunningWindow>& windows) {
+    if (appPath.empty()) return nullptr;
+    for (const auto& w : windows) {
+        if (IsSamePath(w.path, appPath)) return w.hwnd;
+    }
+    return nullptr;
+}
+
 static ID3D11ShaderResourceView* GetTaskbarIcon(ID3D11Device* device, const std::wstring& path) {
-    if (path.empty() || !device) return nullptr;
-    auto it = g_taskbarIconCache.find(path);
-    if (it != g_taskbarIconCache.end()) return it->second;
-    ID3D11ShaderResourceView* icon = TextureLoader::LoadIconFromExe(device, path.c_str());
-    g_taskbarIconCache[path] = icon;
-    return icon;
+    return TextureLoader::GetCachedIcon(device, path);
+}
+
+static RECT g_traySavedRect = {};
+static bool g_traySavedRectValid = false;
+static UINT g_traySavedState = ABS_ALWAYSONTOP;
+static bool g_traySavedStateValid = false;
+
+static void HideOneTray(HWND tray) {
+    if (!tray) return;
+    if (!g_traySavedRectValid) {
+        GetWindowRect(tray, &g_traySavedRect);
+        g_traySavedRectValid = true;
+    }
+    if (!g_traySavedStateValid) {
+        APPBARDATA getAbd = {};
+        getAbd.cbSize = sizeof(getAbd);
+        getAbd.hWnd = tray;
+        g_traySavedState = (UINT)SHAppBarMessage(ABM_GETSTATE, &getAbd);
+        g_traySavedStateValid = true;
+    }
+    APPBARDATA abd = {};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = tray;
+    abd.lParam = ABS_AUTOHIDE;
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    ShowWindow(tray, SW_HIDE);
+    SetWindowPos(tray, HWND_BOTTOM, 0, 8000, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+}
+
+static void ShowOneTray(HWND tray) {
+    if (!tray) return;
+    APPBARDATA abd = {};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = tray;
+    abd.lParam = g_traySavedStateValid ? g_traySavedState : ABS_ALWAYSONTOP;
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    if (g_traySavedRectValid) {
+        SetWindowPos(tray, HWND_TOPMOST,
+                     g_traySavedRect.left, g_traySavedRect.top,
+                     g_traySavedRect.right - g_traySavedRect.left,
+                     g_traySavedRect.bottom - g_traySavedRect.top,
+                     SWP_SHOWWINDOW);
+    } else {
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        SetWindowPos(tray, HWND_TOPMOST, 0, sh - 48, sw, 48, SWP_SHOWWINDOW);
+    }
+    ShowWindow(tray, SW_SHOW);
 }
 
 static void SetSystemTaskbarVisible(bool visible) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (tray) ShowWindow(tray, visible ? SW_SHOW : SW_HIDE);
+    if (visible) ShowOneTray(tray);
+    else HideOneTray(tray);
     HWND secondary = nullptr;
     while (true) {
         secondary = FindWindowExW(nullptr, secondary, L"Shell_SecondaryTrayWnd", nullptr);
         if (!secondary) break;
-        ShowWindow(secondary, visible ? SW_SHOW : SW_HIDE);
+        if (visible) ShowWindow(secondary, SW_SHOW);
+        else { ShowWindow(secondary, SW_HIDE); SetWindowPos(secondary, HWND_BOTTOM, 0, 8000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW); }
     }
+    HWND startBtn = FindWindowW(L"Button", L"Start");
+    if (startBtn) ShowWindow(startBtn, visible ? SW_SHOW : SW_HIDE);
     g_systemTaskbarHidden = !visible;
 }
 

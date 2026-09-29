@@ -96,7 +96,8 @@ struct NetworkStatus {
 static NetworkStatus GetNetworkStatus() {
     NetworkStatus status = { false, false, false };
     ULONG size = 0;
-    DWORD flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    DWORD flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER
+                | GAA_FLAG_SKIP_FRIENDLY_NAME | GAA_FLAG_SKIP_UNICAST;
     GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &size);
     if (size == 0) return status;
 
