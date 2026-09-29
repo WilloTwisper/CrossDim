@@ -233,18 +233,30 @@ static void CloseDesktop(int slotIdx) {
     int removeSlot = slotIdx;
     if (slotIdx == g_activeDesktopIndex) {
         g_myApps.clear();
-        // Hide closing desktop windows, show remaining desktop windows
+        std::vector<HijackedWindow> closingWindows;
         for (const auto& w : g_hijackedWindows) {
-            ShowWindow(w.hwnd, SW_MINIMIZE);
+            if (IsWindow(w.hwnd)) closingWindows.push_back(w);
         }
-        g_desktopWindows[slotIdx] = g_hijackedWindows;
         g_desktopSlots.erase(g_desktopSlots.begin() + removeSlot);
         g_desktopWindows.erase(g_desktopWindows.begin() + removeSlot);
         if (g_activeDesktopIndex >= (int)g_desktopSlots.size())
             g_activeDesktopIndex = (int)g_desktopSlots.size() - 1;
         g_hijackedWindows = g_desktopWindows[g_activeDesktopIndex];
+        for (const auto& w : closingWindows) {
+            bool alreadyIn = false;
+            for (const auto& existing : g_hijackedWindows) {
+                if (existing.hwnd == w.hwnd) { alreadyIn = true; break; }
+            }
+            if (!alreadyIn) {
+                g_hijackedWindows.push_back(w);
+            }
+        }
+        g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
         for (const auto& w : g_hijackedWindows) {
-            if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
+            if (IsWindow(w.hwnd)) {
+                if (w.wasMinimized) ShowWindow(w.hwnd, SW_MINIMIZE);
+                else ShowWindow(w.hwnd, SW_SHOW);
+            }
         }
         ScanDesktopForApps(g_myApps);
         LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
@@ -932,6 +944,7 @@ static void CaptureScreenshot() {
     ID3D11Texture2D* pStaging = nullptr;
     HRESULT hrStg = g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pStaging);
     if (FAILED(hrStg) || !pStaging) {
+        if (pResolve) pResolve->Release();
         pBack->Release();
         LOG("[screenshot] FAIL staging hr=0x%08x w=%u h=%u", hrStg, desc.Width, desc.Height);
         AIServer::g_screenshotResult = "{\"error\":\"staging create failed\"}";
@@ -1252,6 +1265,8 @@ static void ResizeD3DBuffers(UINT width, UINT height) {
 #define WM_APP_CD_SWITCHNEXT (WM_APP + 2)
 #define WM_APP_CD_SWITCHCONFIRM (WM_APP + 3)
 #define WM_APP_CD_SWITCHCANCEL (WM_APP + 4)
+#define WM_APP_CD_SNAP     (WM_APP + 5)
+#define WM_APP_CD_SWITCHDESKTOP (WM_APP + 6)
 #define WM_APP_CD_AIWAKE   (WM_APP + 20)
 #define IDT_HEARTBEAT      1
 
@@ -1279,9 +1294,57 @@ static void OpenOrAdvanceWindowSwitcher() {
 static void ConfirmWindowSwitcher() {
     if (!g_showWindowSwitcher) return;
     if (g_switcherSelected >= 0 && g_switcherSelected < (int)g_switcherWindows.size()) {
-        SetForegroundWindow(g_switcherWindows[g_switcherSelected].first);
+        HWND target = g_switcherWindows[g_switcherSelected].first;
+        if (IsWindow(target)) {
+            if (IsIconic(target)) {
+                ShowWindow(target, SW_RESTORE);
+            }
+            DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+            DWORD targetThread = GetWindowThreadProcessId(target, nullptr);
+            if (fgThread != targetThread) {
+                AttachThreadInput(fgThread, targetThread, TRUE);
+                SetForegroundWindow(target);
+                BringWindowToTop(target);
+                AttachThreadInput(fgThread, targetThread, FALSE);
+            } else {
+                SetForegroundWindow(target);
+                BringWindowToTop(target);
+            }
+        }
     }
     g_showWindowSwitcher = false;
+}
+
+static void SnapHijackedWindow(HWND target, int snapAction) {
+    if (!target || !IsWindow(target)) return;
+    RECT workArea;
+    workArea.left = 0;
+    workArea.top = 0;
+    workArea.right = GetSystemMetrics(SM_CXSCREEN);
+    workArea.bottom = g_taskbarRectValid ? g_taskbarRect.top : GetSystemMetrics(SM_CYSCREEN);
+
+    if (snapAction == 3) { // DOWN: restore if maximized, else minimize
+        if (IsZoomed(target)) {
+            ShowWindow(target, SW_RESTORE);
+        } else {
+            ShowWindow(target, SW_MINIMIZE);
+        }
+        return;
+    }
+    RECT r;
+    if (snapAction == 2) { // UP: Maximize to workArea
+        r = workArea;
+    } else if (snapAction == 0) { // LEFT: Left half
+        r = workArea;
+        r.right = workArea.left + (workArea.right - workArea.left) / 2;
+    } else if (snapAction == 1) { // RIGHT: Right half
+        r = workArea;
+        r.left = workArea.left + (workArea.right - workArea.left) / 2;
+    } else {
+        return;
+    }
+    if (IsZoomed(target)) ShowWindow(target, SW_RESTORE);
+    SetWindowPos(target, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_SHOWWINDOW);
 }
 
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -1289,34 +1352,59 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
         bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
-        if (kb->vkCode == VK_TAB && down) {
-            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-            if (!win) { // never touch Win+Tab / Alt+Tab system combos
-                HWND fg = GetForegroundWindow();
-                bool shellFg = (fg == g_mainHwnd);
-                if (!shellFg) {
-                    for (const auto& w : g_hijackedWindows) {
-                        if (w.hwnd == fg) { shellFg = true; break; }
-                    }
-                }
-                if (ctrl && !alt && !shift) {
-                    if (shellFg) { PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHNEXT, 0, 0); return 1; }
-                } else if (!ctrl && !alt && !shift) {
-                    if (fg == g_mainHwnd) { PostMessageW(g_mainHwnd, WM_APP_CD_TOGGLE, 0, 0); return 1; }
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
+
+        HWND fg = GetForegroundWindow();
+        bool shellFg = (fg == g_mainHwnd);
+        HWND targetHijacked = nullptr;
+        if (!shellFg) {
+            for (const auto& w : g_hijackedWindows) {
+                if (w.hwnd == fg) { shellFg = true; targetHijacked = w.hwnd; break; }
+            }
+        } else {
+            for (auto it = g_hijackedWindows.rbegin(); it != g_hijackedWindows.rend(); ++it) {
+                if (IsWindow(it->hwnd) && IsWindowVisible(it->hwnd) && !IsIconic(it->hwnd)) {
+                    targetHijacked = it->hwnd;
+                    break;
                 }
             }
         }
-        if (g_showWindowSwitcher) {
-            HWND fg = GetForegroundWindow();
-            bool shellFg = (fg == g_mainHwnd);
-            if (!shellFg) {
-                for (const auto& w : g_hijackedWindows) {
-                    if (w.hwnd == fg) { shellFg = true; break; }
+
+        if (kb->vkCode == VK_TAB && down && !win) {
+            if (ctrl && !alt && !shift) {
+                if (shellFg) { PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHNEXT, 0, 0); return 1; }
+            } else if (!ctrl && !alt && !shift) {
+                if (fg == g_mainHwnd) { PostMessageW(g_mainHwnd, WM_APP_CD_TOGGLE, 0, 0); return 1; }
+            }
+        }
+
+        if (down && !win && ctrl && alt && !shift && shellFg) {
+            // Desktop switching: Ctrl+Alt+1..9
+            if (kb->vkCode >= '1' && kb->vkCode <= '9') {
+                int slot = (int)(kb->vkCode - '1');
+                if (slot < GetDesktopSlotCount()) {
+                    PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHDESKTOP, (WPARAM)slot, 0);
+                    return 1;
                 }
             }
+            // Window snapping: Ctrl+Alt+Arrows
+            if (targetHijacked) {
+                int snapAction = -1;
+                if (kb->vkCode == VK_LEFT)  snapAction = 0;
+                if (kb->vkCode == VK_RIGHT) snapAction = 1;
+                if (kb->vkCode == VK_UP)    snapAction = 2;
+                if (kb->vkCode == VK_DOWN)  snapAction = 3;
+                if (snapAction >= 0) {
+                    PostMessageW(g_mainHwnd, WM_APP_CD_SNAP, (WPARAM)snapAction, (LPARAM)targetHijacked);
+                    return 1;
+                }
+            }
+        }
+
+        if (g_showWindowSwitcher) {
             if (shellFg) {
                 if (kb->vkCode == VK_CONTROL && up) {
                     PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHCONFIRM, 0, 0); // pass-through: apps still see the keyup
@@ -1402,6 +1490,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_APP_CD_SWITCHNEXT) { OpenOrAdvanceWindowSwitcher(); return 0; }
     if (msg == WM_APP_CD_SWITCHCONFIRM) { ConfirmWindowSwitcher(); return 0; }
     if (msg == WM_APP_CD_SWITCHCANCEL) { g_showWindowSwitcher = false; return 0; }
+    if (msg == WM_APP_CD_SWITCHDESKTOP) { SwitchToDesktop((int)wParam); return 0; }
+    if (msg == WM_APP_CD_SNAP) { SnapHijackedWindow((HWND)lParam, (int)wParam); return 0; }
     if (msg == WM_KEYDOWN && wParam == VK_TAB && !g_tabHotkeyRegistered) {
         toggleUiUnlock(hWnd);
         return 0;
@@ -1613,34 +1703,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SwitchToDesktop((int)(wParam - '1'));
                     return 0;
                 }
-                RECT workArea;
-                workArea.left = 0;
-                workArea.top = 0;
-                workArea.right = GetSystemMetrics(SM_CXSCREEN);
-                workArea.bottom = g_taskbarRectValid ? g_taskbarRect.top : GetSystemMetrics(SM_CYSCREEN);
-                int snapAction = -1;
-                if (wParam == VK_LEFT)  snapAction = 0;
-                if (wParam == VK_RIGHT) snapAction = 1;
-                if (wParam == VK_UP)    snapAction = 2;
-                if (wParam == VK_DOWN) {
-                    HWND fg = GetForegroundWindow();
-                    for (const auto& w : g_hijackedWindows) {
-                        if (w.hwnd == fg && IsZoomed(fg)) { ShowWindow(fg, SW_RESTORE); snapAction = -1; break; }
-                    }
-                    if (snapAction == -1) return 0;
+                HWND fg = GetForegroundWindow();
+                HWND targetHijacked = nullptr;
+                for (const auto& w : g_hijackedWindows) {
+                    if (w.hwnd == fg) { targetHijacked = w.hwnd; break; }
                 }
-                if (snapAction >= 0) {
-                    HWND fg = GetForegroundWindow();
-                    for (const auto& w : g_hijackedWindows) {
-                        if (w.hwnd == fg) {
-                            RECT r;
-                            if (snapAction == 2) { r = workArea; }
-                            else if (snapAction == 0) { r = workArea; r.right = workArea.left + (workArea.right - workArea.left) / 2; }
-                            else { r = workArea; r.left = workArea.left + (workArea.right - workArea.left) / 2; }
-                            if (IsZoomed(fg)) ShowWindow(fg, SW_RESTORE);
-                            SetWindowPos(fg, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER);
+                if (!targetHijacked) {
+                    for (auto it = g_hijackedWindows.rbegin(); it != g_hijackedWindows.rend(); ++it) {
+                        if (IsWindow(it->hwnd) && IsWindowVisible(it->hwnd) && !IsIconic(it->hwnd)) {
+                            targetHijacked = it->hwnd;
                             break;
                         }
+                    }
+                }
+                if (targetHijacked) {
+                    int snapAction = -1;
+                    if (wParam == VK_LEFT)  snapAction = 0;
+                    if (wParam == VK_RIGHT) snapAction = 1;
+                    if (wParam == VK_UP)    snapAction = 2;
+                    if (wParam == VK_DOWN)  snapAction = 3;
+                    if (snapAction >= 0) {
+                        SnapHijackedWindow(targetHijacked, snapAction);
+                        return 0;
                     }
                 }
                 return 0;
@@ -2028,21 +2112,17 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
                     it = g_pendingHijacks.erase(it);
                     continue;
-                } else {
-                    LOGW(L"[hijack] window found but no valid caption/frame, go back to 3D: HWND=0x%p", target);
-                    it = g_pendingHijacks.erase(it);
-                    if (g_pendingHijacks.empty() && g_hijackedWindows.empty()) {
-                        g_currentState = STATE_3D_EXPLORE;
-                        g_uiUnlocked = true;
-                        while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
-                    }
-                    continue;
                 }
             }
             
             if (it->frameWait > 120) { 
                 LOGW(L"[hijack] pending hijack PID=%u timed out (120 frames)", it->processId);
                 it = g_pendingHijacks.erase(it);
+                if (g_pendingHijacks.empty() && g_hijackedWindows.empty()) {
+                    g_currentState = STATE_3D_EXPLORE;
+                    g_uiUnlocked = true;
+                    while (ShowCursor(TRUE) < 0); ClipCursor(NULL);
+                }
             } else {
                 ++it;
             }
@@ -4357,6 +4437,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     }
     TextureLoader::ShutdownIconCache();
+    ClearWindowIconCache();
     CleanupDevice();
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;

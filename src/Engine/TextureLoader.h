@@ -317,7 +317,7 @@ private:
     }
 
     static void Worker() {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         auto& st = State();
         while (!st.stop.load()) {
             std::wstring path;

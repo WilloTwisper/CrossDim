@@ -68,8 +68,13 @@ static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
         WCHAR title[256];
         GetWindowTextW(hwnd, title, 256);
         if (wcslen(title) > 0) {
-            data->hwnd = hwnd;
-            return FALSE;
+            LONG style = GetWindowLong(hwnd, GWL_STYLE);
+            bool isStandard = ((style & WS_CAPTION) == WS_CAPTION);
+            bool isModernBorderless = !(style & WS_CHILD) && (style & WS_VISIBLE) && ((style & WS_THICKFRAME) || (style & WS_POPUP));
+            if (isStandard || isModernBorderless) {
+                data->hwnd = hwnd;
+                return FALSE;
+            }
         }
     }
     return TRUE;
@@ -213,6 +218,7 @@ static bool g_traySavedStateValid = false;
 
 static void HideOneTray(HWND tray) {
     if (!tray) return;
+    if (g_traySavedRectValid && !IsWindowVisible(tray)) return;
     if (!g_traySavedRectValid) {
         GetWindowRect(tray, &g_traySavedRect);
         g_traySavedRectValid = true;
@@ -264,7 +270,12 @@ static void SetSystemTaskbarVisible(bool visible) {
         secondary = FindWindowExW(nullptr, secondary, L"Shell_SecondaryTrayWnd", nullptr);
         if (!secondary) break;
         if (visible) ShowWindow(secondary, SW_SHOW);
-        else { ShowWindow(secondary, SW_HIDE); SetWindowPos(secondary, HWND_BOTTOM, 0, 8000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW); }
+        else {
+            if (IsWindowVisible(secondary)) {
+                ShowWindow(secondary, SW_HIDE);
+                SetWindowPos(secondary, HWND_BOTTOM, 0, 8000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+            }
+        }
     }
     HWND startBtn = FindWindowW(L"Button", L"Start");
     if (startBtn) ShowWindow(startBtn, visible ? SW_SHOW : SW_HIDE);
@@ -313,4 +324,14 @@ static ID3D11ShaderResourceView* GetWindowIconTexture(ID3D11Device* device, HWND
         g_taskbarWindowIconCache.erase(it);
     }
     return icon;
+}
+
+static void ClearWindowIconCache() {
+    for (auto& pair : g_taskbarWindowIconCache) {
+        if (pair.second) {
+            pair.second->Release();
+            pair.second = nullptr;
+        }
+    }
+    g_taskbarWindowIconCache.clear();
 }
