@@ -38,15 +38,44 @@ static void ShutdownAudioEndpointVolume() {
 
 static float GetMasterVolumeLevelScalar() {
     float level = 0.7f;
+    if (!g_audioEndpoint) {
+        InitAudioEndpointVolume();
+    }
     if (g_audioEndpoint) {
         float v = 0.0f;
-        if (SUCCEEDED(g_audioEndpoint->GetMasterVolumeLevelScalar(&v))) {
+        HRESULT hr = g_audioEndpoint->GetMasterVolumeLevelScalar(&v);
+        if (SUCCEEDED(hr)) {
             level = v;
+        } else {
+            // Audio endpoint invalidated (e.g. headphone unplugged / default device changed)
+            ShutdownAudioEndpointVolume();
+            if (InitAudioEndpointVolume() && g_audioEndpoint) {
+                if (SUCCEEDED(g_audioEndpoint->GetMasterVolumeLevelScalar(&v))) {
+                    level = v;
+                }
+            }
         }
     }
     if (level < 0.0f) level = 0.0f;
     if (level > 1.0f) level = 1.0f;
     return level;
+}
+
+static bool SetMasterVolumeLevelScalar(float lvl) {
+    if (lvl < 0.0f) lvl = 0.0f;
+    if (lvl > 1.0f) lvl = 1.0f;
+    if (!g_audioEndpoint) {
+        InitAudioEndpointVolume();
+    }
+    if (g_audioEndpoint) {
+        HRESULT hr = g_audioEndpoint->SetMasterVolumeLevelScalar(lvl, nullptr);
+        if (SUCCEEDED(hr)) return true;
+        ShutdownAudioEndpointVolume();
+        if (InitAudioEndpointVolume() && g_audioEndpoint) {
+            return SUCCEEDED(g_audioEndpoint->SetMasterVolumeLevelScalar(lvl, nullptr));
+        }
+    }
+    return false;
 }
 
 static void GetImeLabel(HWND hwnd, char* buffer, size_t bufferSize) {

@@ -487,6 +487,7 @@ static void ExitFolderToRoot(Camera& camera) {
     g_isFolderMaximized = true;
     camera.Position = g_desktopBackupCamPos;
     camera.Rotation = g_desktopBackupCamRot;
+    g_needRescan = true;
     PruneUnusedIconCache();
     AIServer::EmitEvent("folder_exit", "{\"depth\":0}");
 }
@@ -800,12 +801,10 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
     }
     else if (action == "set_volume") {
         std::string v = Json::GetStringField(actionJson, "level");
-        if (!v.empty() && g_audioEndpoint) {
+        if (!v.empty()) {
             float lvl = (float)atof(v.c_str());
-            if (lvl < 0.0f) lvl = 0.0f;
-            if (lvl > 1.0f) lvl = 1.0f;
-            g_audioEndpoint->SetMasterVolumeLevelScalar(lvl, nullptr);
-            AIServer::g_actionResult = "{\"ok\":true,\"action\":\"set_volume\",\"level\":" + std::to_string(lvl) + "}";
+            bool ok = SetMasterVolumeLevelScalar(lvl);
+            AIServer::g_actionResult = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"action\":\"set_volume\",\"level\":" + std::to_string(lvl) + "}";
         }
     }
     else if (action == "get_log") {
@@ -1476,12 +1475,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     RECT r; GetWindowRect(win.hwnd, &r);
                     if (PtInRect(&r, pt)) {
                         float barHeight = 30.0f;
-                        float btnSize = 14.0f;
-                        float btnGap = 8.0f;
-                        float btnPad = 10.0f;
-                        float ctrlWidth = btnSize * 3.0f + btnGap * 2.0f;
-                        RECT btnRect = { (LONG)(r.right - (LONG)(btnPad + ctrlWidth)), r.top, (LONG)(r.right - btnPad), (LONG)(r.top + barHeight) };
-                        if (PtInRect(&btnRect, pt)) return HTCLIENT;
+                        if (pt.y < r.top + (LONG)barHeight) return HTCLIENT;
                         return HTTRANSPARENT;
                     }
                 }
@@ -2865,8 +2859,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImGui::Separator();
                 ImGui::BeginChild("StartAllApps", ImVec2(-1.0f, -8.0f * scale), false, ImGuiWindowFlags_NoBackground);
                 int shown = 0;
-                for (int pi = 0; pi < (int)g_startPrograms.size(); ++pi) {
-                    const auto& sp = g_startPrograms[pi];
+                std::vector<StartProgram> programsSnapshot;
+                {
+                    std::lock_guard<std::mutex> lock(g_startMenuMutex);
+                    programsSnapshot = g_startPrograms;
+                }
+                for (int pi = 0; pi < (int)programsSnapshot.size(); ++pi) {
+                    const auto& sp = programsSnapshot[pi];
                     if (g_searchFilter[0] && !SearchMatch(g_searchFilter, sp.name, sp.lnkPath) &&
                         !SearchMatch(g_searchFilter, sp.category, sp.targetPath))
                         continue;
@@ -2947,7 +2946,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 panelDraw->AddRectFilled(q0, q1, IM_COL32(244, 246, 250, 235), 12.0f);
                 panelDraw->AddRect(q0, q1, IM_COL32(255, 255, 255, 120), 12.0f);
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.15f, 0.18f, 0.24f, 1.0f));
-                ImGui::Text(s_trayIcons.empty() ? "(no tray icons detected)" : "System Tray");
+                ImGui::Text(s_trayIcons.empty() ? "(no tray icons detected - Win11 XAML tray)" : "System Tray");
                 ImGui::Separator();
                 for (const auto& icon : s_trayIcons) {
                     ID3D11ShaderResourceView* iconSrv = nullptr;
@@ -3720,6 +3719,21 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && pGrabIdx >= 0) {
                 pGrabIdx = -1; pDragging = false;
             }
+            if (g_rightClicked) g_rightClicked = false;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                if (portalHitIdx >= 0) {
+                    if (!g_folderCubes[portalHitIdx].IsSelected) {
+                        if (!g_ctrlHeld) { for (auto& c : g_folderCubes) c.IsSelected = false; }
+                        g_folderCubes[portalHitIdx].IsSelected = true;
+                    }
+                    std::vector<std::wstring> paths;
+                    for (const auto& c : g_folderCubes)
+                        if (c.IsSelected && !c.AppPath.empty()) paths.push_back(c.AppPath);
+                    QueueShellItemMenu(paths);
+                } else {
+                    QueueShellBackgroundMenu(g_folderStack.empty() ? CurrentShellFolder() : g_folderStack.back().folderPath);
+                }
+            }
         }
 
         if (!mouseInPortal) {
@@ -4209,74 +4223,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             }
         }
 
-        // Folder portal interaction (windowed mode)
-        if (g_isInFolder && !g_isFolderMaximized && !g_folderCubes.empty()) {
-            RECT& fwr = g_folderWindowRect;
-            float fwW = (float)(fwr.right - fwr.left), fwH = (float)(fwr.bottom - fwr.top);
-            DirectX::XMMATRIX fInvVP = DirectX::XMMatrixInverse(nullptr,
-                g_folderCamera.GetViewMatrix() * g_folderCamera.GetProjectionMatrix(90.0f, fwW / (fwH > 0 ? fwH : 1.0f), 0.1f, 100.0f));
-            ImVec2 mouse = ImGui::GetIO().MousePos;
-            bool mouseInsidePortal = (mouse.x >= fwr.left && mouse.x <= fwr.right && mouse.y >= fwr.top && mouse.y <= fwr.bottom);
-            float fmx = (mouse.x - fwr.left) / fwW;
-            float fmy = (mouse.y - fwr.top) / fwH;
-            fmx = fmx * 2.0f - 1.0f;
-            fmy = 1.0f - fmy * 2.0f;
-            DirectX::XMVECTOR fnear = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 0.0f, 1.0f), fInvVP);
-            DirectX::XMVECTOR ffar = DirectX::XMVector3TransformCoord(DirectX::XMVectorSet(fmx, fmy, 1.0f, 1.0f), fInvVP);
-            DirectX::XMVECTOR fOrigin = DirectX::XMLoadFloat3(&g_folderCamera.Position);
-            DirectX::XMVECTOR fRayDir = DirectX::XMVector3Normalize(DirectX::XMVectorSubtract(ffar, fOrigin));
-
-            int fHitIdx = -1;
-            float fMinDist = 9999.0f;
-            for (int i = 0; i < (int)g_folderCubes.size(); ++i) {
-                g_folderCubes[i].IsHovered = false;
-                DirectX::BoundingBox box(g_folderCubes[i].Position, DirectX::XMFLOAT3(0.6f, 0.6f, 0.3f));
-                float dist;
-                if (box.Intersects(fOrigin, fRayDir, dist)) {
-                    if (dist < fMinDist) { fMinDist = dist; fHitIdx = i; }
-                }
-            }
-            if (fHitIdx >= 0) g_folderCubes[fHitIdx].IsHovered = true;
-
-            static DWORD s_fLastClickT = 0;
-            static int s_fLastIdx = -1;
-            if (mouseInsidePortal && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && fHitIdx >= 0) {
-                if (GetTickCount() - s_fLastClickT < 400 && s_fLastIdx == fHitIdx) {
-                    if (CubeIsDirectory(g_folderCubes[fHitIdx])) {
-                        EnterFolder(CubeFolderPath(g_folderCubes[fHitIdx]), camera);
-                    } else {
-                        LaunchCube(g_folderCubes[fHitIdx]);
-                    }
-                    s_fLastClickT = 0;
-                } else {
-                    s_fLastClickT = GetTickCount();
-                    s_fLastIdx = fHitIdx;
-                    if (!g_ctrlHeld) {
-                        for (auto& c : g_folderCubes) c.IsSelected = false;
-                    }
-                    g_folderCubes[fHitIdx].IsSelected = true;
-                }
-            }
-            // Click on empty area in portal deselects
-            if (mouseInsidePortal && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && fHitIdx < 0) {
-                for (auto& c : g_folderCubes) c.IsSelected = false;
-            }
-            if (g_rightClicked && mouseInsidePortal) g_rightClicked = false;
-            if (mouseInsidePortal && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                if (fHitIdx >= 0) {
-                    if (!g_folderCubes[fHitIdx].IsSelected) {
-                        if (!g_ctrlHeld) { for (auto& c : g_folderCubes) c.IsSelected = false; }
-                        g_folderCubes[fHitIdx].IsSelected = true;
-                    }
-                    std::vector<std::wstring> paths;
-                    for (const auto& c : g_folderCubes)
-                        if (c.IsSelected && !c.AppPath.empty()) paths.push_back(c.AppPath);
-                    QueueShellItemMenu(paths);
-                } else {
-                    QueueShellBackgroundMenu(g_folderStack.empty() ? CurrentShellFolder() : g_folderStack.back().folderPath);
-                }
-            }
-        }
 
         // AI Control Interface: process pending HTTP requests (main thread)
         static bool aiActionShotPending = false; // deferred action-attached screenshot

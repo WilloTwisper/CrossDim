@@ -60,7 +60,7 @@ static std::wstring ResolveShortcutTarget(LPCWSTR lnkPath) {
     IPersistFile* persistFile = nullptr;
     if (SUCCEEDED(shellLink->QueryInterface(IID_PPV_ARGS(&persistFile)))) {
         if (SUCCEEDED(persistFile->Load(lnkPath, STGM_READ))) {
-            shellLink->Resolve(nullptr, SLR_NO_UI | SLR_UPDATE);
+            shellLink->Resolve(nullptr, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK);
             WCHAR buf[MAX_PATH];
             if (SUCCEEDED(shellLink->GetPath(buf, MAX_PATH, nullptr, SLGP_RAWPATH))) target = buf;
         }
@@ -151,18 +151,6 @@ static bool CollectFileEntry(const WIN32_FIND_DATAW& fd, const std::wstring& ful
     }
     if (_wcsicmp(ext.c_str(), L".lnk") == 0) {
         out.targetPath = ResolveShortcutTarget(fullPath.c_str());
-        IShellLinkW* sl = nullptr;
-        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) {
-            IPersistFile* pf = nullptr;
-            if (SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf)))) {
-                if (SUCCEEDED(pf->Load(fullPath.c_str(), STGM_READ))) {
-                    WCHAR desc[256];
-                    if (SUCCEEDED(sl->GetDescription(desc, 256)) && desc[0]) out.displayName = WcsToUtf8(desc);
-                }
-                pf->Release();
-            }
-            sl->Release();
-        }
         return true;
     }
     if (_wcsicmp(ext.c_str(), L".exe") == 0) return true;

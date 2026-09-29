@@ -14,12 +14,24 @@ struct TrayIconEntry {
 
 static HWND FindTrayToolbar() {
     HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!hTray) return nullptr;
-    HWND hNotify = FindWindowExW(hTray, nullptr, L"TrayNotifyWnd", nullptr);
-    if (!hNotify) return nullptr;
-    HWND hPager = FindWindowExW(hNotify, nullptr, L"SysPager", nullptr);
-    if (!hPager) return nullptr;
-    return FindWindowExW(hPager, nullptr, L"ToolbarWindow32", nullptr);
+    if (hTray) {
+        HWND hNotify = FindWindowExW(hTray, nullptr, L"TrayNotifyWnd", nullptr);
+        if (hNotify) {
+            HWND hPager = FindWindowExW(hNotify, nullptr, L"SysPager", nullptr);
+            if (hPager) {
+                HWND hTool = FindWindowExW(hPager, nullptr, L"ToolbarWindow32", nullptr);
+                if (hTool) return hTool;
+            }
+            HWND hTool = FindWindowExW(hNotify, nullptr, L"ToolbarWindow32", nullptr);
+            if (hTool) return hTool;
+        }
+    }
+    HWND hOverflow = FindWindowW(L"NotifyIconOverflowWindow", nullptr);
+    if (hOverflow) {
+        HWND hTool = FindWindowExW(hOverflow, nullptr, L"ToolbarWindow32", nullptr);
+        if (hTool) return hTool;
+    }
+    return nullptr;
 }
 
 // Explorer's toolbar lives in another process: if Explorer hangs, a bare
@@ -31,20 +43,17 @@ static LRESULT TraySendMessage(HWND hToolbar, UINT msg, WPARAM w, LPARAM l, DWOR
     return (LRESULT)result;
 }
 
-static std::vector<TrayIconEntry> QueryTrayIcons() {
-    std::vector<TrayIconEntry> result;
-    HWND hToolbar = FindTrayToolbar();
-    if (!hToolbar) return result;
-
+static void QueryToolbarIcons(HWND hToolbar, std::vector<TrayIconEntry>& result) {
+    if (!hToolbar) return;
     DWORD pid = 0;
     GetWindowThreadProcessId(hToolbar, &pid);
-    if (pid == 0) return result;
+    if (pid == 0) return;
 
     HANDLE hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, pid);
-    if (!hProc) return result;
+    if (!hProc) return;
 
     int btnCount = (int)TraySendMessage(hToolbar, TB_BUTTONCOUNT, 0, 0);
-    if (btnCount <= 0 || btnCount > 64) { CloseHandle(hProc); return result; }
+    if (btnCount <= 0 || btnCount > 128) { CloseHandle(hProc); return; }
 
     for (int i = 0; i < btnCount; i++) {
         void* remoteTb = VirtualAllocEx(hProc, nullptr, sizeof(TBBUTTON), MEM_COMMIT, PAGE_READWRITE);
@@ -80,5 +89,33 @@ static std::vector<TrayIconEntry> QueryTrayIcons() {
     }
 
     CloseHandle(hProc);
+}
+
+static std::vector<TrayIconEntry> QueryTrayIcons() {
+    std::vector<TrayIconEntry> result;
+    HWND hMainToolbar = nullptr;
+    HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (hTray) {
+        HWND hNotify = FindWindowExW(hTray, nullptr, L"TrayNotifyWnd", nullptr);
+        if (hNotify) {
+            HWND hPager = FindWindowExW(hNotify, nullptr, L"SysPager", nullptr);
+            if (hPager) {
+                hMainToolbar = FindWindowExW(hPager, nullptr, L"ToolbarWindow32", nullptr);
+            }
+            if (!hMainToolbar) {
+                hMainToolbar = FindWindowExW(hNotify, nullptr, L"ToolbarWindow32", nullptr);
+            }
+        }
+    }
+    if (hMainToolbar) QueryToolbarIcons(hMainToolbar, result);
+
+    HWND hOverflow = FindWindowW(L"NotifyIconOverflowWindow", nullptr);
+    if (hOverflow) {
+        HWND hOverflowToolbar = FindWindowExW(hOverflow, nullptr, L"ToolbarWindow32", nullptr);
+        if (hOverflowToolbar && hOverflowToolbar != hMainToolbar) {
+            QueryToolbarIcons(hOverflowToolbar, result);
+        }
+    }
+
     return result;
 }
