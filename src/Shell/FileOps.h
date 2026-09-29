@@ -18,7 +18,15 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
 
+#include <thread>
+#include <functional>
+
+#ifndef WM_APP_CD_AIWAKE
+#define WM_APP_CD_AIWAKE   (WM_APP + 20)
+#endif
+
 extern HWND g_mainHwnd;
+extern bool g_needRescan;
 
 // Win32 shell file operations + real IContextMenu. Cubes are filesystem
 // items; these helpers talk to Explorer's documented COM/file APIs so the
@@ -60,8 +68,26 @@ static bool ShellFileOp(UINT func, const std::vector<std::wstring>& from, const 
     return r == 0 && !op.fAnyOperationsAborted;
 }
 
+static void ShellFileOpAsync(UINT func, const std::vector<std::wstring>& from, const std::wstring& toDir = L"", FILEOP_FLAGS extra = 0, std::function<void(bool)> onComplete = nullptr) {
+    if (from.empty()) return;
+    std::thread([func, from, toDir, extra, onComplete]() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        bool ok = ShellFileOp(func, from, toDir.empty() ? nullptr : toDir.c_str(), extra);
+        if (ok) {
+            g_needRescan = true;
+            if (g_mainHwnd) PostMessageW(g_mainHwnd, WM_APP_CD_AIWAKE, 0, 0);
+        }
+        if (onComplete) onComplete(ok);
+        if (SUCCEEDED(hr)) CoUninitialize();
+    }).detach();
+}
+
 static bool RecyclePaths(const std::vector<std::wstring>& paths) {
     return ShellFileOp(FO_DELETE, paths, nullptr, FOF_NOCONFIRMATION);
+}
+
+static void RecyclePathsAsync(const std::vector<std::wstring>& paths) {
+    ShellFileOpAsync(FO_DELETE, paths, L"", FOF_NOCONFIRMATION);
 }
 
 static bool MovePaths(const std::vector<std::wstring>& from, const std::wstring& destDir) {
@@ -69,9 +95,19 @@ static bool MovePaths(const std::vector<std::wstring>& from, const std::wstring&
     return ShellFileOp(FO_MOVE, from, destDir.c_str());
 }
 
+static void MovePathsAsync(const std::vector<std::wstring>& from, const std::wstring& destDir) {
+    if (destDir.empty()) return;
+    ShellFileOpAsync(FO_MOVE, from, destDir);
+}
+
 static bool CopyPaths(const std::vector<std::wstring>& from, const std::wstring& destDir) {
     if (destDir.empty()) return false;
     return ShellFileOp(FO_COPY, from, destDir.c_str());
+}
+
+static void CopyPathsAsync(const std::vector<std::wstring>& from, const std::wstring& destDir) {
+    if (destDir.empty()) return;
+    ShellFileOpAsync(FO_COPY, from, destDir);
 }
 
 static bool RenamePath(const std::wstring& from, const std::wstring& to) {
@@ -156,11 +192,20 @@ static bool PasteFromClipboard(const std::wstring& destDir) {
     }
     CloseClipboard();
     if (paths.empty()) return false;
-    bool ok = (effect & DROPEFFECT_MOVE) ? MovePaths(paths, destDir) : CopyPaths(paths, destDir);
-    if (ok && (effect & DROPEFFECT_MOVE)) {
-        if (OpenClipboard(g_mainHwnd)) { EmptyClipboard(); CloseClipboard(); }
-    }
-    return ok;
+    bool isMove = (effect & DROPEFFECT_MOVE);
+    std::thread([paths, destDir, isMove]() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        bool ok = isMove ? MovePaths(paths, destDir) : CopyPaths(paths, destDir);
+        if (ok && isMove) {
+            if (OpenClipboard(g_mainHwnd)) { EmptyClipboard(); CloseClipboard(); }
+        }
+        if (ok) {
+            g_needRescan = true;
+            if (g_mainHwnd) PostMessageW(g_mainHwnd, WM_APP_CD_AIWAKE, 0, 0);
+        }
+        if (SUCCEEDED(hr)) CoUninitialize();
+    }).detach();
+    return true;
 }
 
 static bool HandleMenuMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT* out) {

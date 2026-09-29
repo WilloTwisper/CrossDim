@@ -24,6 +24,7 @@ inline std::vector<PendingHijack> g_pendingHijacks;
 struct HijackedWindow {
     HWND hwnd;
     LONG originalStyle = 0; // GWL_STYLE captured before hijack, restored on exit
+    bool wasMinimized = false;
 };
 inline std::vector<HijackedWindow> g_hijackedWindows;
 

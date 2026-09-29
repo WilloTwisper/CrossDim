@@ -35,6 +35,8 @@ namespace AIServer {
 inline std::mutex g_reqMutex;
 inline std::mutex g_rpcMutex; // serialize action + screenshot across HTTP worker threads
 inline std::atomic<bool> g_finished{false};
+inline std::atomic<int> g_activeConnections{0};
+constexpr int kMaxConcurrentConnections = 16;
 
 inline std::string g_sharedStateJson;         // published by main thread (mutex-protected)
 inline std::string g_pendingAction;           // action JSON written by HTTP thread
@@ -452,7 +454,17 @@ static void ServerThreadProc() {
         if (sel > 0 && FD_ISSET(listenSock, &readfds)) {
             SOCKET client = accept(listenSock, nullptr, nullptr);
             if (client != INVALID_SOCKET) {
-                std::thread(HandleConnection, client).detach();
+                if (g_activeConnections.load() >= kMaxConcurrentConnections) {
+                    const char* resp503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(client, resp503, (int)strlen(resp503), 0);
+                    closesocket(client);
+                } else {
+                    g_activeConnections.fetch_add(1);
+                    std::thread([client]() {
+                        HandleConnection(client);
+                        g_activeConnections.fetch_sub(1);
+                    }).detach();
+                }
             }
         }
     }

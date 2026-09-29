@@ -169,8 +169,9 @@ static void SwitchToDesktop(int slotIdx) {
     if (slotIdx == g_activeDesktopIndex || slotIdx < 0 || slotIdx >= (int)g_desktopSlots.size()) return;
     if (g_targetDesktopIndex >= 0) return;
     SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
-    // Hide all windows on current desktop
-    for (const auto& w : g_hijackedWindows) {
+    // Hide all windows on current desktop, capturing minimized state
+    for (auto& w : g_hijackedWindows) {
+        w.wasMinimized = IsIconic(w.hwnd) != FALSE;
         ShowWindow(w.hwnd, SW_HIDE);
     }
     g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
@@ -181,9 +182,12 @@ static void SwitchToDesktop(int slotIdx) {
 static void CompleteDesktopSwitch() {
     g_myApps.clear();
     g_hijackedWindows = g_desktopWindows[g_targetDesktopIndex];
-    // Show all windows on new desktop
+    // Show windows on new desktop respecting minimized state
     for (const auto& w : g_hijackedWindows) {
-        if (IsWindow(w.hwnd)) ShowWindow(w.hwnd, SW_SHOW);
+        if (IsWindow(w.hwnd)) {
+            if (w.wasMinimized) ShowWindow(w.hwnd, SW_MINIMIZE);
+            else ShowWindow(w.hwnd, SW_SHOW);
+        }
     }
     ScanDesktopForApps(g_myApps);
     LoadDesktopState(g_myApps, DesktopIdAt(g_targetDesktopIndex), &g_desktopRemovedPaths[DesktopIdAt(g_targetDesktopIndex)]);
@@ -200,7 +204,8 @@ static void CreateNewDesktop() {
     g_desktopSlots.push_back(newId);
     SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     // Hide current desktop's windows and save to cache
-    for (const auto& w : g_hijackedWindows) {
+    for (auto& w : g_hijackedWindows) {
+        w.wasMinimized = IsIconic(w.hwnd) != FALSE;
         ShowWindow(w.hwnd, SW_HIDE);
     }
     g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
@@ -710,7 +715,7 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
     else if (action == "delete_selected") {
         auto paths = SelectedItemPaths();
         int removed = (int)paths.size();
-        if (!paths.empty() && FileOps::RecyclePaths(paths)) g_needRescan = true;
+        if (!paths.empty()) FileOps::RecyclePathsAsync(paths);
         AIServer::g_actionResult = "{\"ok\":true,\"action\":\"delete_selected\",\"removed\":" + std::to_string(removed) + "}";
     }
     else if (action == "select") {
@@ -1197,6 +1202,47 @@ void CleanupDevice() {
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
+static void ResizeD3DBuffers(UINT width, UINT height) {
+    if (!g_pd3dDevice || !g_pSwapChain || width == 0 || height == 0) return;
+    if (g_pd3dDeviceContext) g_pd3dDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    if (g_mainDepthStencilView) { g_mainDepthStencilView->Release(); g_mainDepthStencilView = nullptr; }
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+
+    HRESULT hr = g_pSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) {
+        LOG("[d3d] ResizeBuffers failed hr=0x%08lx", hr);
+        return;
+    }
+
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    hr = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    if (SUCCEEDED(hr) && pBackBuffer) {
+        g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+        pBackBuffer->Release();
+    }
+
+    DXGI_SWAP_CHAIN_DESC scd = {};
+    g_pSwapChain->GetDesc(&scd);
+
+    D3D11_TEXTURE2D_DESC depthDesc = {};
+    depthDesc.Width = width;
+    depthDesc.Height = height;
+    depthDesc.MipLevels = 1;
+    depthDesc.ArraySize = 1;
+    depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depthDesc.SampleDesc = scd.SampleDesc;
+    depthDesc.Usage = D3D11_USAGE_DEFAULT;
+    depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    ID3D11Texture2D* pDepthStencil = nullptr;
+    hr = g_pd3dDevice->CreateTexture2D(&depthDesc, nullptr, &pDepthStencil);
+    if (SUCCEEDED(hr) && pDepthStencil) {
+        g_pd3dDevice->CreateDepthStencilView(pDepthStencil, nullptr, &g_mainDepthStencilView);
+        pDepthStencil->Release();
+    }
+    LOG("[d3d] Buffers resized to %ux%u", width, height);
+}
+
 
 // ---- Low-level keyboard routing -------------------------------------------
 // RegisterHotKey(VK_TAB) used to swallow Tab system-wide. The low-level hook
@@ -1378,6 +1424,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
+        case WM_ACTIVATE: {
+            WORD act = LOWORD(wParam);
+            if (act == WA_INACTIVE) {
+                ClipCursor(nullptr);
+                while (ShowCursor(TRUE) < 0);
+                g_ctrlHeld = false;
+                g_lButtonHeld = false;
+            } else {
+                if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
+                    while (ShowCursor(FALSE) >= 0);
+                    RECT rect;
+                    GetClientRect(hWnd, &rect);
+                    MapWindowPoints(hWnd, nullptr, (POINT*)&rect, 2);
+                    ClipCursor(&rect);
+                }
+            }
+            return 0;
+        }
+        case WM_KILLFOCUS: {
+            ClipCursor(nullptr);
+            while (ShowCursor(TRUE) < 0);
+            g_ctrlHeld = false;
+            g_lButtonHeld = false;
+            return 0;
+        }
+        case WM_SIZE: {
+            if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
+                ResizeD3DBuffers((UINT)LOWORD(lParam), (UINT)HIWORD(lParam));
+            }
+            return 0;
+        }
+        case WM_DISPLAYCHANGE: {
+            int sw = GetSystemMetrics(SM_CXSCREEN);
+            int sh = GetSystemMetrics(SM_CYSCREEN);
+            SetWindowPos(hWnd, HWND_TOP, 0, 0, sw, sh, SWP_SHOWWINDOW);
+            ResizeD3DBuffers((UINT)sw, (UINT)sh);
+            return 0;
+        }
         case WM_NCHITTEST: {
             if (g_uiUnlocked) {
                 POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -3021,9 +3105,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ImU32 closeColor = closeHover ? IM_COL32(255, 95, 95, 230) : IM_COL32(255, 120, 120, 210);
                 chromeDraw->AddCircleFilled(ImVec2(x + btnSize * 0.5f, btnY + btnSize * 0.5f), btnSize * 0.48f, closeColor);
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                    ShowWindow(win.hwnd, SW_HIDE);
                     PostMessage(win.hwnd, WM_CLOSE, 0, 0);
-                    continue;
                 }
 
                 x -= btnGap + btnSize;
@@ -3738,8 +3820,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (g_deleteRequested) {
             g_deleteRequested = false;
             auto paths = SelectedItemPaths();
-            if (!paths.empty() && FileOps::RecyclePaths(paths))
-                g_needRescan = true;
+            if (!paths.empty())
+                FileOps::RecyclePathsAsync(paths);
         }
 
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (g_lButtonHeld)) {
@@ -3850,10 +3932,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 }
                 std::wstring destFolder = CubeFolderPath(target);
                 if (!destFolder.empty() && !srcPaths.empty()) {
-                    if (FileOps::MovePaths(srcPaths, destFolder)) {
-                        LOGW(L"[drop] Move %d item(s) -> %s", (int)srcPaths.size(), destFolder.c_str());
-                        g_needRescan = true;
-                    }
+                    LOGW(L"[drop] Move %d item(s) -> %s", (int)srcPaths.size(), destFolder.c_str());
+                    FileOps::MovePathsAsync(srcPaths, destFolder);
                 } else if (PathLooksLikeExe(CubeLaunchPath(target)) && !srcPaths.empty()) {
                     HINSTANCE res = ShellExecuteW(NULL, L"open", CubeLaunchPath(target).c_str(),
                                                    srcPaths[0].c_str(), NULL, SW_SHOWNORMAL);
@@ -4269,7 +4349,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             bool focused = (GetForegroundWindow() == hwnd);
             UINT vsync = focused ? 1 : 0;
             HRESULT hrPresent = g_pSwapChain->Present(vsync, 0);
-            if (hrPresent == DXGI_STATUS_OCCLUDED || !focused) {
+            if (hrPresent == DXGI_ERROR_DEVICE_REMOVED || hrPresent == DXGI_ERROR_DEVICE_RESET) {
+                HRESULT reason = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : hrPresent;
+                LOG("[d3d] FATAL: Device removed/reset hr=0x%08lx reason=0x%08lx. Initiating recovery shutdown.", hrPresent, reason);
+                PostQuitMessage(1);
+            } else if (hrPresent == DXGI_STATUS_OCCLUDED || !focused) {
                 if (g_hHeartbeatEvent) SetEvent(g_hHeartbeatEvent);
             }
         }

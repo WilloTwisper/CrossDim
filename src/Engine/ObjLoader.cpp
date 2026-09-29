@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <windows.h>
+#include <algorithm>
 
 using namespace DirectX;
 
@@ -23,26 +25,35 @@ namespace {
         uint32_t indexCount;
     };
 
-    bool GetFileInfo(const std::string& path, uint64_t& outSize, int64_t& outMtime) {
+    static std::wstring ToWidePath(const std::string& path) {
+        if (path.empty()) return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (len <= 0) return {};
+        std::wstring result(len - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &result[0], len);
+        return result;
+    }
+
+    bool GetFileInfo(const std::wstring& path, uint64_t& outSize, int64_t& outMtime) {
         struct _stat64 st;
-        if (_stat64(path.c_str(), &st) != 0) return false;
+        if (_wstat64(path.c_str(), &st) != 0) return false;
         outSize = static_cast<uint64_t>(st.st_size);
         outMtime = static_cast<int64_t>(st.st_mtime);
         return true;
     }
 
-    std::string MakeCachePath(const std::string& objPath) {
-        return objPath + ".cdmesh";
+    std::wstring MakeCachePath(const std::wstring& objPath) {
+        return objPath + L".cdmesh";
     }
 
-    bool TryLoadMeshCache(const std::string& objPath,
+    bool TryLoadMeshCache(const std::wstring& objPath,
                           std::vector<ModelVertex>& outVertices,
                           std::vector<unsigned int>& outIndices) {
         uint64_t objSize = 0;
         int64_t objMtime = 0;
         if (!GetFileInfo(objPath, objSize, objMtime)) return false;
 
-        std::ifstream in(MakeCachePath(objPath), std::ios::binary);
+        std::ifstream in(MakeCachePath(objPath).c_str(), std::ios::binary);
         if (!in) return false;
 
         MeshCacheHeader hdr = {};
@@ -72,7 +83,7 @@ namespace {
         return true;
     }
 
-    void WriteMeshCache(const std::string& objPath,
+    void WriteMeshCache(const std::wstring& objPath,
                         const std::vector<ModelVertex>& vertices,
                         const std::vector<unsigned int>& indices) {
         uint64_t objSize = 0;
@@ -81,7 +92,7 @@ namespace {
 
         if (vertices.size() > UINT32_MAX || indices.size() > UINT32_MAX) return;
 
-        std::ofstream out(MakeCachePath(objPath), std::ios::binary | std::ios::trunc);
+        std::ofstream out(MakeCachePath(objPath).c_str(), std::ios::binary | std::ios::trunc);
         if (!out) return;
 
         MeshCacheHeader hdr = {};
@@ -127,20 +138,30 @@ bool ObjLoader::LoadObj(const std::string& filepath, std::vector<ModelVertex>& o
     outVertices.clear();
     outIndices.clear();
 
-    if (TryLoadMeshCache(filepath, outVertices, outIndices)) {
+    std::wstring wpath = ToWidePath(filepath);
+    if (wpath.empty()) return false;
+
+    if (TryLoadMeshCache(wpath, outVertices, outIndices)) {
         return true;
     }
 
+    uint64_t objSize = 0;
+    int64_t objMtime = 0;
+    GetFileInfo(wpath, objSize, objMtime);
+
     FILE* fp = nullptr;
-    fopen_s(&fp, filepath.c_str(), "r");
+    _wfopen_s(&fp, wpath.c_str(), L"r");
     if (!fp) return false;
 
-    // 预分配大内存，绝不让 std::vector 中途扩容卡死
-    std::vector<XMFLOAT3> temp_positions; temp_positions.reserve(1000000);
-    std::vector<XMFLOAT2> temp_uvs;       temp_uvs.reserve(1000000);
-    std::vector<XMFLOAT3> temp_normals;   temp_normals.reserve(1000000);
+    // 动态预分配：根据文件尺寸估计顶点数量，避免盲目分配 100MB+ 内存
+    size_t estCount = (objSize > 0) ? (size_t)(objSize / 40) : 4096;
+    estCount = std::clamp(estCount, (size_t)1024, (size_t)1000000);
+
+    std::vector<XMFLOAT3> temp_positions; temp_positions.reserve(estCount);
+    std::vector<XMFLOAT2> temp_uvs;       temp_uvs.reserve(estCount);
+    std::vector<XMFLOAT3> temp_normals;   temp_normals.reserve(estCount);
     std::unordered_map<VertexKey, unsigned int, VertexKeyHash> uniqueVertices;
-    uniqueVertices.reserve(2000000);
+    uniqueVertices.reserve(estCount * 2);
 
     char line[512];
     // 🚨 极速 C-style 字符串读取，不占用任何额外堆内存！
@@ -212,7 +233,7 @@ bool ObjLoader::LoadObj(const std::string& filepath, std::vector<ModelVertex>& o
     fclose(fp);
 
     if (!outVertices.empty() && !outIndices.empty()) {
-        WriteMeshCache(filepath, outVertices, outIndices);
+        WriteMeshCache(wpath, outVertices, outIndices);
     }
 
     return true;

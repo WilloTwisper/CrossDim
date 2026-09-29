@@ -155,9 +155,17 @@ static std::string ExtractLastToken(const std::string& line) {
 }
 
 bool ModelRenderer::LoadModelAsync(const std::string& filepath) {
+    std::wstring wfilepath;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath.c_str(), -1, nullptr, 0);
+    if (wlen > 1) {
+        wfilepath.resize(wlen - 1);
+        MultiByteToWideChar(CP_UTF8, 0, filepath.c_str(), -1, &wfilepath[0], wlen);
+    }
+
     std::string mtllib, usemtl;
     {
-        std::ifstream in(filepath); std::string line;
+        std::ifstream in(wfilepath.c_str());
+        std::string line;
         while (std::getline(in, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back(); // 🚨 清除恶心的 \r
             if (line.rfind("mtllib ", 0) == 0) mtllib = line.substr(7);
@@ -171,7 +179,13 @@ bool ModelRenderer::LoadModelAsync(const std::string& filepath) {
 
     if (!mtllib.empty()) {
         std::string mtlPath = baseDir + mtllib;
-        std::ifstream mtl(mtlPath);
+        std::wstring wmtlPath;
+        int mlen = MultiByteToWideChar(CP_UTF8, 0, mtlPath.c_str(), -1, nullptr, 0);
+        if (mlen > 1) {
+            wmtlPath.resize(mlen - 1);
+            MultiByteToWideChar(CP_UTF8, 0, mtlPath.c_str(), -1, &wmtlPath[0], mlen);
+        }
+        std::ifstream mtl(wmtlPath.c_str());
         if (mtl.is_open()) {
             std::string line, current;
             while (std::getline(mtl, line)) {
@@ -207,6 +221,7 @@ bool ModelRenderer::LoadModelAsync(const std::string& filepath) {
     if (m_loadInProgress.load()) return false; 
     m_loadInProgress.store(true); m_loadReady.store(false);
     
+    if (m_loadThread.joinable()) m_loadThread.join();
     m_loadThread = std::thread([this, filepath]() {
         std::vector<ModelVertex> v; std::vector<unsigned int> i;
         bool ok = ObjLoader::LoadObj(filepath, v, i);
