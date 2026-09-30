@@ -70,6 +70,12 @@ inline std::wstring CurrentShellFolder() {
 
 inline std::vector<std::wstring> SelectedItemPaths() {
     std::vector<std::wstring> paths;
+    if (g_isInFolder && !g_isFolderMaximized) {
+        for (const auto& c : g_folderCubes) {
+            if (c.IsSelected && !c.AppPath.empty()) paths.push_back(c.AppPath);
+        }
+        if (!paths.empty()) return paths;
+    }
     for (const auto& c : g_myApps) {
         if (c.IsSelected && !c.AppPath.empty()) paths.push_back(c.AppPath);
     }

@@ -165,7 +165,7 @@ inline void RenderWindowChrome() {
                              SWP_NOZORDER);
             }
             LONG style = GetWindowLong(win.hwnd, GWL_STYLE);
-            if (!(style & WS_THICKFRAME)) {
+            if (!(style & WS_THICKFRAME) && (win.originalStyle & WS_THICKFRAME)) {
                 SetWindowLong(win.hwnd, GWL_STYLE, style | WS_THICKFRAME);
                 SetWindowPos(win.hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             }

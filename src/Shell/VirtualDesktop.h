@@ -31,6 +31,58 @@ inline std::vector<std::vector<HijackedWindow>> g_desktopWindows;
 
 inline int GetDesktopSlotCount() { return (int)g_desktopSlots.size(); }
 
+inline void SaveVirtualDesktopsConfig() {
+    HANDLE hFile = CreateFileW(L"desktops.cfg", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    DWORD magic = 0x4B534556; // "VESK"
+    DWORD version = 1;
+    DWORD slotCount = (DWORD)g_desktopSlots.size();
+    DWORD activeIdx = (DWORD)g_activeDesktopIndex;
+    DWORD nextId = (DWORD)g_nextDesktopId;
+    WriteFile(hFile, &magic, sizeof(magic), &written, nullptr);
+    WriteFile(hFile, &version, sizeof(version), &written, nullptr);
+    WriteFile(hFile, &slotCount, sizeof(slotCount), &written, nullptr);
+    WriteFile(hFile, &activeIdx, sizeof(activeIdx), &written, nullptr);
+    WriteFile(hFile, &nextId, sizeof(nextId), &written, nullptr);
+    if (slotCount > 0) {
+        WriteFile(hFile, g_desktopSlots.data(), (DWORD)(slotCount * sizeof(int)), &written, nullptr);
+    }
+    CloseHandle(hFile);
+}
+
+inline bool LoadVirtualDesktopsConfig() {
+    HANDLE hFile = CreateFileW(L"desktops.cfg", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD read = 0;
+    DWORD magic = 0, version = 0, slotCount = 0, activeIdx = 0, nextId = 1;
+    if (!ReadFile(hFile, &magic, sizeof(magic), &read, nullptr) || magic != 0x4B534556) {
+        CloseHandle(hFile);
+        return false;
+    }
+    if (!ReadFile(hFile, &version, sizeof(version), &read, nullptr) || version != 1) {
+        CloseHandle(hFile);
+        return false;
+    }
+    ReadFile(hFile, &slotCount, sizeof(slotCount), &read, nullptr);
+    ReadFile(hFile, &activeIdx, sizeof(activeIdx), &read, nullptr);
+    ReadFile(hFile, &nextId, sizeof(nextId), &read, nullptr);
+    if (slotCount > 0 && slotCount <= 16) {
+        std::vector<int> slots(slotCount);
+        if (ReadFile(hFile, slots.data(), (DWORD)(slotCount * sizeof(int)), &read, nullptr)) {
+            g_desktopSlots = slots;
+            g_desktopWindows.assign(slotCount, {});
+            g_nextDesktopId = (int)nextId;
+            if (activeIdx < slotCount) g_activeDesktopIndex = (int)activeIdx;
+            else g_activeDesktopIndex = 0;
+            CloseHandle(hFile);
+            return true;
+        }
+    }
+    CloseHandle(hFile);
+    return false;
+}
+
 inline void SwitchToDesktop(int slotIdx) {
     if (slotIdx == g_activeDesktopIndex || slotIdx < 0 || slotIdx >= (int)g_desktopSlots.size()) return;
     if (g_targetDesktopIndex >= 0) return;
@@ -62,6 +114,7 @@ inline void CompleteDesktopSwitch() {
     g_activeDesktopIndex = g_targetDesktopIndex;
     g_targetDesktopIndex = -1;
     g_desktopTransition = 1.0f;
+    SaveVirtualDesktopsConfig();
     AIServer::EmitEvent("desktop_switch", "{\"index\":" + std::to_string(g_activeDesktopIndex) + "}");
 }
 
@@ -84,6 +137,7 @@ inline void CreateNewDesktop() {
     LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     SeparateOverlappingCubes(g_myApps);
     LoadIconsForApps(g_myApps);
+    SaveVirtualDesktopsConfig();
     AIServer::EmitEvent("desktop_create", "{\"index\":" + std::to_string(g_activeDesktopIndex) + "}");
 }
 
@@ -145,6 +199,7 @@ inline void CloseDesktop(int slotIdx) {
             g_desktopWindows[g_activeDesktopIndex] = g_hijackedWindows;
         }
     }
+    SaveVirtualDesktopsConfig();
     AIServer::EmitEvent("desktop_close", "{\"slot\":" + std::to_string(slotIdx) + ",\"count\":" + std::to_string(g_desktopSlots.size()) + "}");
 }
 

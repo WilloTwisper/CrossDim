@@ -337,7 +337,22 @@ static void ExecuteAIAction(const std::string& actionJson, Camera& camera) {
     else if (action == "delete_selected") {
         auto paths = SelectedItemPaths();
         int removed = (int)paths.size();
-        if (!paths.empty()) FileOps::RecyclePathsAsync(paths);
+        if (!paths.empty()) {
+            FileOps::RecyclePathsAsync(paths);
+            auto& tombs = g_desktopRemovedPaths[ActiveDesktopId()];
+            for (const auto& p : paths) {
+                if (std::find(tombs.begin(), tombs.end(), p) == tombs.end()) tombs.push_back(p);
+            }
+            g_myApps.erase(std::remove_if(g_myApps.begin(), g_myApps.end(), [](const AppCube& c) {
+                return c.IsSelected;
+            }), g_myApps.end());
+            if (g_isInFolder && !g_isFolderMaximized) {
+                g_folderCubes.erase(std::remove_if(g_folderCubes.begin(), g_folderCubes.end(), [](const AppCube& c) {
+                    return c.IsSelected;
+                }), g_folderCubes.end());
+            }
+            SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
+        }
         AIServer::g_actionResult = "{\"ok\":true,\"action\":\"delete_selected\",\"removed\":" + std::to_string(removed) + "}";
     }
     else if (action == "select") {
@@ -881,7 +896,7 @@ static void ResizeD3DBuffers(UINT width, UINT height) {
 
 static HHOOK g_keyboardHook = nullptr;
 
-static void OpenOrAdvanceWindowSwitcher() {
+static void OpenOrAdvanceWindowSwitcher(bool reverse = false) {
     if (!g_showWindowSwitcher) {
         g_switcherWindows.clear();
         for (const auto& w : g_hijackedWindows) {
@@ -892,11 +907,14 @@ static void OpenOrAdvanceWindowSwitcher() {
         }
         if (!g_switcherWindows.empty()) {
             g_showWindowSwitcher = true;
-            g_switcherSelected = 0;
+            g_switcherSelected = (g_switcherWindows.size() > 1) ? 1 : 0;
         }
     } else {
         int n = (int)g_switcherWindows.size();
-        if (n > 0) g_switcherSelected = (g_switcherSelected + 1) % n;
+        if (n > 0) {
+            if (reverse) g_switcherSelected = (g_switcherSelected - 1 + n) % n;
+            else g_switcherSelected = (g_switcherSelected + 1) % n;
+        }
     }
 }
 
@@ -919,6 +937,13 @@ static void ConfirmWindowSwitcher() {
                 SetForegroundWindow(target);
                 BringWindowToTop(target);
             }
+            if (g_currentState != STATE_2D_WORKBENCH) {
+                g_previousUiUnlocked = g_uiUnlocked;
+                g_currentState = STATE_2D_WORKBENCH;
+            }
+            g_uiUnlocked = true;
+            while (ShowCursor(TRUE) < 0);
+            ClipCursor(NULL);
         }
     }
     g_showWindowSwitcher = false;
@@ -951,8 +976,11 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         }
 
         if (kb->vkCode == VK_TAB && down && !win) {
-            if (ctrl && !alt && !shift) {
-                if (shellFg) { PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHNEXT, 0, 0); return 1; }
+            if (ctrl && !alt) {
+                if (shellFg) {
+                    PostMessageW(g_mainHwnd, WM_APP_CD_SWITCHNEXT, shift ? 1 : 0, 0);
+                    return 1;
+                }
             } else if (!ctrl && !alt && !shift) {
                 if (fg == g_mainHwnd) { PostMessageW(g_mainHwnd, WM_APP_CD_TOGGLE, 0, 0); return 1; }
             }
@@ -1009,9 +1037,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             (g_currentState == STATE_2D_WORKBENCH) ? "2D" : "3D",
             g_hijackedWindows.size(), g_pendingHijacks.size());
         if (g_uiUnlocked) {
+            SetFocus(hwnd);
             while (ShowCursor(TRUE) < 0);
             ClipCursor(NULL);
         } else {
+            SetFocus(hwnd);
             while (ShowCursor(FALSE) >= 0);
 
             RECT rect;
@@ -1064,7 +1094,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     if (msg == WM_APP_CD_AIWAKE) return 0; // wake PeekMessage; do not toggle UI
     if (msg == WM_APP_CD_TOGGLE) { toggleUiUnlock(hWnd); return 0; }
-    if (msg == WM_APP_CD_SWITCHNEXT) { OpenOrAdvanceWindowSwitcher(); return 0; }
+    if (msg == WM_APP_CD_SWITCHNEXT) { OpenOrAdvanceWindowSwitcher(wParam != 0); return 0; }
     if (msg == WM_APP_CD_SWITCHCONFIRM) { ConfirmWindowSwitcher(); return 0; }
     if (msg == WM_APP_CD_SWITCHCANCEL) { g_showWindowSwitcher = false; return 0; }
     if (msg == WM_APP_CD_SWITCHDESKTOP) { SwitchToDesktop((int)wParam); return 0; }
@@ -1098,6 +1128,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_ctrlHeld = false;
                 g_lButtonHeld = false;
             } else {
+                SetFocus(hWnd);
                 if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked) {
                     while (ShowCursor(FALSE) >= 0);
                     RECT rect;
@@ -1189,6 +1220,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             g_lButtonHeld = true;
             if (g_currentState == STATE_3D_EXPLORE) {
+                SetFocus(hWnd);
                 g_leftClicked = true;
             } 
             else if (g_currentState == STATE_2D_WORKBENCH || g_uiUnlocked) {
@@ -1203,9 +1235,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             if (PtInRect(&r, pt)) { inHijacked = true; break; }
                         }
                         if (!inHijacked) {
+                            SetFocus(hWnd);
                             g_leftClicked = true;
                         }
                     } else {
+                        SetFocus(hWnd);
                         g_leftClicked = true;
                     }
                     // 点击在 ImGui 窗口外部时的处理可选择性地切换
@@ -1498,15 +1532,18 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (!modelRenderer.Initialize(g_pd3dDevice)) LOG("[init] ModelRenderer::Initialize failed");
 
     modelRenderer.LoadModelAsync(WcsToUtf8(ResolveRuntimePathW(L"assets\\bloom_high\\bloom_high.obj")));
-    LOG("[init] scan desktop");
+    if (!LoadVirtualDesktopsConfig()) {
+        g_desktopSlots = { 0 };
+        g_desktopWindows = { {} };
+        g_activeDesktopIndex = 0;
+        g_nextDesktopId = 1;
+    }
+    LOG("[init] scan desktop (active desktop id=%d)", ActiveDesktopId());
     ScanDesktopForApps(g_myApps);
     LoadDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     SeparateOverlappingCubes(g_myApps);
     LoadIconsForApps(g_myApps);
     InitDesktopWatchers();
-    g_desktopSlots = { 0 };
-    g_desktopWindows = { {} };
-    g_activeDesktopIndex = 0;
     LOG("[init] desktop cubes=%d", (int)g_myApps.size());
 
     IMGUI_CHECKVERSION();
@@ -2192,8 +2229,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         if (g_deleteRequested) {
             g_deleteRequested = false;
             auto paths = SelectedItemPaths();
-            if (!paths.empty())
+            if (!paths.empty()) {
                 FileOps::RecyclePathsAsync(paths);
+                auto& tombs = g_desktopRemovedPaths[ActiveDesktopId()];
+                for (const auto& p : paths) {
+                    if (std::find(tombs.begin(), tombs.end(), p) == tombs.end()) tombs.push_back(p);
+                }
+                g_myApps.erase(std::remove_if(g_myApps.begin(), g_myApps.end(), [](const AppCube& c) {
+                    return c.IsSelected;
+                }), g_myApps.end());
+                if (g_isInFolder && !g_isFolderMaximized) {
+                    g_folderCubes.erase(std::remove_if(g_folderCubes.begin(), g_folderCubes.end(), [](const AppCube& c) {
+                        return c.IsSelected;
+                    }), g_folderCubes.end());
+                }
+                SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
+            }
         }
 
         if (g_currentState == STATE_3D_EXPLORE && !g_uiUnlocked && (g_lButtonHeld)) {
@@ -2714,6 +2765,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     } else {
         SaveDesktopState(g_myApps, ActiveDesktopId(), &g_desktopRemovedPaths[ActiveDesktopId()]);
     }
+    SaveVirtualDesktopsConfig();
     TextureLoader::ShutdownIconCache();
     ClearWindowIconCache();
     CleanupDevice();

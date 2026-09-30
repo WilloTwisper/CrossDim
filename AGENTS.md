@@ -144,13 +144,20 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | 15 | Model/assets CWD-relative paths failed when launched outside project root (Bloom model never loaded from `build\`) | Fixed v0.1.1 — CWD anchored to exe dir + `ResolveRuntimePathW` fallback |
 | 16 | `get_log` always empty (`fopen_s` opens non-shareable → EACCES vs Logger's handle) | Fixed v0.1.1 — plain `fopen` |
 | 17 | AI screenshot all-black (MSAA check after `SampleDesc` overwrite) and missed 2D UI (captured before ImGui render) | Fixed v0.1.1 — proper resolve path + capture after ImGui, before Present |
+| 18 | `Ctrl+Tab` switcher selected current window on first press | Fixed v0.1.9 — defaults to index 1 (previous window); supports `Ctrl+Shift+Tab` backward cycle |
+| 19 | `ConfirmWindowSwitcher` did not restore 2D mode/cursor | Fixed v0.1.9 — auto-transitions to `STATE_2D_WORKBENCH` and unclips cursor |
+| 20 | Keyboard focus lost on activation / desktop click | Fixed v0.1.9 — explicit `SetFocus(hwnd)` calls in `WM_ACTIVATE`, mode toggles, and click handlers |
+| 21 | Virtual desktop configuration lost across restarts | Fixed v0.1.9 — persisted to `desktops.cfg` |
+| 22 | Taskbar pinned applications & order reset on exit | Fixed v0.1.9 — persisted to `taskbar.cfg`; context menu Pin/Unpin/Close added |
+| 23 | Desktop cube deletion never recorded tombstones | Fixed v0.1.9 — immediate removal, tombstone persistence to `.cddesk`, async recycling |
+| 24 | WindowChrome titlebar drag corrupted fixed-frame window styles | Fixed v0.1.9 — only restores `WS_THICKFRAME` if present in `originalStyle` |
 
 ## Feature Roadmap
 
 ### Phase 1 — Stability & Foundation (~620 lines, Debug: Med-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | ✅ for cubes — positions + removal tombstones via `.cddesk` v3 (per virtual desktop). Pinned apps/preferences still not persisted |
+| 1.1 | Config persistence (save/load pinned apps, cube positions, preferences via binary format) | ~280 | Medium | None | ✅ for cubes (`.cddesk` v3), pinned apps (`taskbar.cfg`), and virtual desktops (`desktops.cfg`) |
 | 1.2 | Split `main.cpp` into ShellManager / TaskbarRenderer / CubeInteraction / WindowHijackManager | ~200 new | **High** | None | ✅ — fully modularized: split into `VirtualDesktop.h`, `FolderPortal.h`, `WindowChrome.h`, `TaskbarUI.h`, `DesktopManager.h`, `WindowManager.h`, `SystemInfo.h`. main.cpp 4444→2722 lines (~39% reduction) |
 | 1.3 | Memory leak fixes (icon cache pruning, ModelRenderer thread detach) | ~60 | Low | None | ✅ |
 | 1.4 | `GetAsyncKeyState` → message-queue-driven input tracking | ~80 | Medium | None | ✅ |
@@ -158,7 +165,7 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 ### Phase 2 — Desktop Completeness (~880 lines, Debug: Medium)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
-| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | Partial — save/load, right-click context menu + API removal with tombstone persistence ✅. `VK_DELETE` handler still unwired (`g_deleteRequested` never set). File picker/Start Menu scan still TODO |
+| 2.1 | Dynamic desktop icon system (file picker, Start Menu scan, add/remove at runtime) | ~310 | Medium | 1.1 | ✅ save/load, right-click context menu, VK_DELETE immediate removal + tombstone persistence, Start Menu pin to taskbar |
 | 2.2 | File system integration (file/folder cubes, Explorer drag-drop, SHGetFileInfo icons) | ~310 | Med-High | 2.1 | ✅ |
 | 2.3 | Camera movement (WASD + scroll zoom, `Camera::Move()` already implemented) | ~100 | Low | None | Removed (excluded from design) |
 | 2.4 | Search engine (hook existing Start Menu search box, substring filter on apps/cubes) | ~160 | Low-Med | 2.1 | ✅ |
@@ -167,8 +174,8 @@ Explorer.exe ← Background COM service (no desktop, no taskbar)
 | # | Feature | Lines | Difficulty | Dependencies | Status |
 |---|---|---|---|---|---|
 | 3.1 | Window snapping (edge snap, keyboard shortcuts, visual indicators) | ~220 | Medium | 1.2 | ✅ — drag-to-edge half/maximize/quarter, blue preview overlay, Ctrl+Alt+Arrows shortcuts |
-| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | ✅ basic — `Ctrl+Tab` 3D card switcher, hold-to-cycle, release confirms; no DWM thumbnails yet |
-| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | ✅ basic — switch/create/close, per-desktop `.cddesk` (ID-named), window stash/restore; multi-desktop state not restored across restarts |
+| 3.2 | Alt+Tab replacement (DWM thumbnails, 3D spatial switcher) | ~280 | **High** | None | ✅ `Ctrl+Tab` 3D card switcher with index 1 default, reverse cycling, release confirmation, auto-workbench transition |
+| 3.3 | Virtual desktops (multiple workspaces, transition animation, per-desktop cube sets) | ~240 | Med-High | 1.1 | ✅ switch/create/close, per-desktop `.cddesk`, window stash/restore, full restart persistence via `desktops.cfg` |
 
 ### Phase 4 — Polish & Enhancement (~445 lines, Debug: Low-High)
 | # | Feature | Lines | Difficulty | Dependencies | Status |

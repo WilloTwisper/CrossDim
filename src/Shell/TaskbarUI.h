@@ -49,6 +49,99 @@ struct TaskbarEntry {
     DWORD Pid;
 };
 
+inline void SaveTaskbarConfig(const std::vector<TaskbarEntry>& pinned) {
+    HANDLE hFile = CreateFileW(L"taskbar.cfg", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    DWORD magic = 0x424B5354; // "TSKB"
+    DWORD version = 1;
+    DWORD count = 0;
+    for (const auto& e : pinned) if (e.Pinned) count++;
+    WriteFile(hFile, &magic, sizeof(magic), &written, nullptr);
+    WriteFile(hFile, &version, sizeof(version), &written, nullptr);
+    WriteFile(hFile, &count, sizeof(count), &written, nullptr);
+    for (const auto& e : pinned) {
+        if (!e.Pinned) continue;
+        WORD idLen = (WORD)e.Id.size();
+        WriteFile(hFile, &idLen, sizeof(idLen), &written, nullptr);
+        if (idLen > 0) WriteFile(hFile, e.Id.data(), idLen, &written, nullptr);
+
+        WORD labelLen = (WORD)e.Label.size();
+        WriteFile(hFile, &labelLen, sizeof(labelLen), &written, nullptr);
+        if (labelLen > 0) WriteFile(hFile, e.Label.data(), labelLen, &written, nullptr);
+
+        WORD pathLen = (WORD)e.AppPath.size();
+        WriteFile(hFile, &pathLen, sizeof(pathLen), &written, nullptr);
+        if (pathLen > 0) WriteFile(hFile, e.AppPath.data(), (DWORD)(pathLen * sizeof(wchar_t)), &written, nullptr);
+
+        WriteFile(hFile, &e.Accent, sizeof(e.Accent), &written, nullptr);
+        int action = (int)e.Action;
+        WriteFile(hFile, &action, sizeof(action), &written, nullptr);
+        int kind = (int)e.IconKind;
+        WriteFile(hFile, &kind, sizeof(kind), &written, nullptr);
+    }
+    CloseHandle(hFile);
+}
+
+inline bool LoadTaskbarConfig(std::vector<TaskbarEntry>& outPinned) {
+    HANDLE hFile = CreateFileW(L"taskbar.cfg", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD read;
+    DWORD magic = 0, version = 0, count = 0;
+    if (!ReadFile(hFile, &magic, sizeof(magic), &read, nullptr) || magic != 0x424B5354) {
+        CloseHandle(hFile);
+        return false;
+    }
+    if (!ReadFile(hFile, &version, sizeof(version), &read, nullptr) || version != 1) {
+        CloseHandle(hFile);
+        return false;
+    }
+    if (!ReadFile(hFile, &count, sizeof(count), &read, nullptr) || count == 0 || count > 64) {
+        CloseHandle(hFile);
+        return false;
+    }
+    outPinned.clear();
+    for (DWORD i = 0; i < count; ++i) {
+        WORD idLen = 0;
+        if (!ReadFile(hFile, &idLen, sizeof(idLen), &read, nullptr)) break;
+        std::string id(idLen, '\0');
+        if (idLen > 0) ReadFile(hFile, &id[0], idLen, &read, nullptr);
+
+        WORD labelLen = 0;
+        if (!ReadFile(hFile, &labelLen, sizeof(labelLen), &read, nullptr)) break;
+        std::string label(labelLen, '\0');
+        if (labelLen > 0) ReadFile(hFile, &label[0], labelLen, &read, nullptr);
+
+        WORD pathLen = 0;
+        if (!ReadFile(hFile, &pathLen, sizeof(pathLen), &read, nullptr)) break;
+        std::wstring path(pathLen, L'\0');
+        if (pathLen > 0) ReadFile(hFile, &path[0], (DWORD)(pathLen * sizeof(wchar_t)), &read, nullptr);
+
+        ImU32 accent = IM_COL32(255, 255, 255, 255);
+        ReadFile(hFile, &accent, sizeof(accent), &read, nullptr);
+        int action = 0;
+        ReadFile(hFile, &action, sizeof(action), &read, nullptr);
+        int kind = 0;
+        ReadFile(hFile, &kind, sizeof(kind), &read, nullptr);
+
+        TaskbarEntry entry = {};
+        entry.Id = id;
+        entry.Label = label;
+        entry.AppPath = path;
+        entry.Accent = accent;
+        entry.Action = (TaskbarAction)action;
+        entry.IconKind = (TaskbarIconKind)kind;
+        entry.Icon = nullptr;
+        entry.Pinned = true;
+        entry.Running = false;
+        entry.Hwnd = nullptr;
+        entry.Pid = 0;
+        outPinned.push_back(entry);
+    }
+    CloseHandle(hFile);
+    return !outPinned.empty();
+}
+
 inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
 
@@ -57,14 +150,17 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
     static bool taskbarTrayOpen = false;
     static bool taskbarPinnedInit = false;
     if (!taskbarPinnedInit) {
-        taskbarPinned = {
-            { "Taskbar.Start",  "Start",  L"", IM_COL32(0, 140, 255, 255), TASKBAR_ACTION_START, TASKBAR_ICON_WINDOWS, nullptr, true, false, nullptr, 0 },
-            { "Taskbar.Search", "Search", L"", IM_COL32(120, 170, 255, 255), TASKBAR_ACTION_NONE,  TASKBAR_ICON_SEARCH, nullptr, true, false, nullptr, 0 },
-            { "Taskbar.Files",  "Files",  L"C:\\Windows\\explorer.exe", IM_COL32(255, 210, 120, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
-            { "Taskbar.Edge",   "Edge",   L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", IM_COL32(120, 210, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
-            { "Taskbar.Terminal", "Terminal", L"C:\\Windows\\System32\\cmd.exe", IM_COL32(140, 255, 170, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
-            { "Taskbar.Code",   "Code",   L"D:\\Apps\\Microsoft VS Code\\Code.exe", IM_COL32(120, 185, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 }
-        };
+        if (!LoadTaskbarConfig(taskbarPinned)) {
+            taskbarPinned = {
+                { "Taskbar.Start",  "Start",  L"", IM_COL32(0, 140, 255, 255), TASKBAR_ACTION_START, TASKBAR_ICON_WINDOWS, nullptr, true, false, nullptr, 0 },
+                { "Taskbar.Search", "Search", L"", IM_COL32(120, 170, 255, 255), TASKBAR_ACTION_NONE,  TASKBAR_ICON_SEARCH, nullptr, true, false, nullptr, 0 },
+                { "Taskbar.Files",  "Files",  L"C:\\Windows\\explorer.exe", IM_COL32(255, 210, 120, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                { "Taskbar.Edge",   "Edge",   L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", IM_COL32(120, 210, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                { "Taskbar.Terminal", "Terminal", L"C:\\Windows\\System32\\cmd.exe", IM_COL32(140, 255, 170, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 },
+                { "Taskbar.Code",   "Code",   L"D:\\Apps\\Microsoft VS Code\\Code.exe", IM_COL32(120, 185, 255, 255), TASKBAR_ACTION_LAUNCH, TASKBAR_ICON_APP, nullptr, true, false, nullptr, 0 }
+            };
+            SaveTaskbarConfig(taskbarPinned);
+        }
         taskbarPinnedInit = true;
     }
 
@@ -454,6 +550,42 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
             PostMessage(entry.Hwnd, WM_CLOSE, 0, 0);
         }
 
+        char ctxPopupId[64];
+        sprintf_s(ctxPopupId, "##TaskbarCtx_%d", i);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && entry.IconKind == TASKBAR_ICON_APP) {
+            ImGui::OpenPopup(ctxPopupId);
+        }
+        if (ImGui::BeginPopup(ctxPopupId)) {
+            if (entry.Pinned) {
+                if (ImGui::MenuItem("Unpin from taskbar")) {
+                    int pinIdx = -1;
+                    for (int pIdx = 0; pIdx < (int)taskbarPinned.size(); ++pIdx) {
+                        if (taskbarPinned[pIdx].AppPath == entry.AppPath) { pinIdx = pIdx; break; }
+                    }
+                    if (pinIdx >= 0) {
+                        taskbarPinned.erase(taskbarPinned.begin() + pinIdx);
+                        SaveTaskbarConfig(taskbarPinned);
+                    }
+                }
+            } else {
+                if (ImGui::MenuItem("Pin to taskbar")) {
+                    TaskbarEntry newPin = entry;
+                    newPin.Pinned = true;
+                    newPin.Running = false;
+                    newPin.Hwnd = nullptr;
+                    newPin.Pid = 0;
+                    taskbarPinned.push_back(newPin);
+                    SaveTaskbarConfig(taskbarPinned);
+                }
+            }
+            if (isRunning && entry.Hwnd) {
+                if (ImGui::MenuItem("Close window")) {
+                    PostMessage(entry.Hwnd, WM_CLOSE, 0, 0);
+                }
+            }
+            ImGui::EndPopup();
+        }
+
         if (dragItemMoved && dragItemId == itemId && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             float slot = (ImGui::GetIO().MousePos.x - rowStartX + (drawIconSize * 0.5f)) / (drawIconSize + drawIconGap);
             int target = (int)slot;
@@ -464,6 +596,7 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
                 if (target != dragPinnedIndex && target >= 0 && dragPinnedIndex >= 0 && dragPinnedIndex < pinnedCount) {
                     std::swap(taskbarPinned[dragPinnedIndex], taskbarPinned[target]);
                     dragPinnedIndex = target;
+                    SaveTaskbarConfig(taskbarPinned);
                 }
             } else if (dynamicCount > 1) {
                 int dynIndex = i - pinnedCount;
@@ -629,6 +762,7 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
     ImGui::End();
     ImGui::PopStyleVar(3);
 
+    static bool s_lastStartOpen = false;
     if (taskbarStartOpen) {
         EnsureStartMenuScanned();
         float panelWidth = 480.0f * scale;
@@ -666,6 +800,12 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
         panelDraw->AddRectFilled(s0, s1, IM_COL32(255, 255, 255, 220), searchHeight * 0.5f);
         panelDraw->AddRect(s0, s1, IM_COL32(0, 0, 0, 25), searchHeight * 0.5f, 0, 1.0f);
 
+        bool startJustOpened = !s_lastStartOpen;
+        s_lastStartOpen = true;
+        if (startJustOpened) {
+            g_searchFilter[0] = '\0';
+        }
+
         float sCenterY = (s0.y + s1.y) * 0.5f;
         drawSearchGlyph(ImVec2(s0.x + searchHeight * 0.5f, sCenterY), searchHeight * 0.7f, IM_COL32(100, 110, 130, 200));
 
@@ -674,6 +814,9 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(0.2f, 0.5f, 1.0f, 0.35f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+        if (startJustOpened) {
+            ImGui::SetKeyboardFocusHere();
+        }
         ImGui::InputTextWithHint("##StartSearch", "Type to search apps...", g_searchFilter, sizeof(g_searchFilter));
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
@@ -775,6 +918,33 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
             ImGui::InvisibleButton("StartProg", ImVec2(ImGui::GetContentRegionAvail().x, rowH));
             bool hov = ImGui::IsItemHovered();
             bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+            bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            char progMenuId[64];
+            sprintf_s(progMenuId, "##ProgMenu_%d", pi);
+            if (rclk) ImGui::OpenPopup(progMenuId);
+            if (ImGui::BeginPopup(progMenuId)) {
+                if (ImGui::MenuItem("Pin to taskbar")) {
+                    std::wstring lpath = StartLaunchPath(sp);
+                    bool already = false;
+                    for (const auto& pin : taskbarPinned) {
+                        if (pin.AppPath == lpath) { already = true; break; }
+                    }
+                    if (!already) {
+                        TaskbarEntry e = {};
+                        e.Id = "Taskbar." + sp.name;
+                        e.Label = sp.name;
+                        e.AppPath = lpath;
+                        e.Accent = IM_COL32(120, 180, 240, 255);
+                        e.Action = TASKBAR_ACTION_LAUNCH;
+                        e.IconKind = TASKBAR_ICON_APP;
+                        e.Icon = TextureLoader::PeekCachedIcon(sp.lnkPath);
+                        e.Pinned = true;
+                        taskbarPinned.push_back(e);
+                        SaveTaskbarConfig(taskbarPinned);
+                    }
+                }
+                ImGui::EndPopup();
+            }
             ImDrawList* rd = ImGui::GetWindowDrawList();
             ImVec2 rowMax = ImGui::GetItemRectMax();
             if (hov) rd->AddRectFilled(rowMin, rowMax, IM_COL32(255, 255, 255, 180), 8.0f * scale);
@@ -797,6 +967,8 @@ inline void RenderTaskbar(ID3D11Device* device, HWND hwnd) {
 
         ImGui::End();
         ImGui::PopStyleVar(3);
+    } else {
+        s_lastStartOpen = false;
     }
 
     if (taskbarTrayOpen) {
